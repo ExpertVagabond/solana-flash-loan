@@ -21,6 +21,8 @@ import { BotMetrics, printMetricsSummary } from "../utils/metrics";
 import { parsePair } from "../utils/tokens";
 import { ArbitrageOpportunity } from "./profit-calculator";
 import { JitoClient } from "../providers/jito-client";
+import { MultiDexClient, CrossDexOpportunity } from "../providers/multi-dex-client";
+import { OracleClient } from "../providers/oracle-client";
 
 export class ArbitrageEngine {
   private connection: Connection;
@@ -32,6 +34,8 @@ export class ArbitrageEngine {
   private metrics: BotMetrics;
   private logger: pino.Logger;
   private jitoClient: JitoClient | null;
+  private multiDex: MultiDexClient;
+  private oracle: OracleClient;
   private running = false;
   private consecutiveFailures = 0;
   private metricsIntervalId: ReturnType<typeof setInterval> | null = null;
@@ -59,6 +63,8 @@ export class ArbitrageEngine {
     this.metrics = metrics;
     this.logger = logger;
     this.jitoClient = jitoClient;
+    this.multiDex = new MultiDexClient(logger, jupiterClient);
+    this.oracle = new OracleClient(connection, logger);
   }
 
   async start(): Promise<void> {
@@ -132,6 +138,44 @@ export class ArbitrageEngine {
             }
 
             await this.executeArbitrage(opportunity);
+          }
+        }
+
+        // Phase 2: Cross-DEX arb scan (buy cheap DEX, sell expensive DEX)
+        for (let i = 0; i < this.config.pairs.length; i++) {
+          if (!this.running) break;
+          const pair = this.config.pairs[i];
+          const [targetToken, quoteToken] = parsePair(pair);
+
+          try {
+            const crossDex = await this.multiDex.findCrossDexArb(
+              pair,
+              quoteToken,
+              targetToken,
+              this.config.borrowAmount,
+              9 // pool fee bps
+            );
+
+            if (crossDex && crossDex.grossProfitBps >= this.config.minProfitBps) {
+              this.metrics.opportunitiesFound++;
+              if (this.config.dryRun) {
+                this.logger.info(
+                  {
+                    pair,
+                    buyDex: crossDex.buyDex,
+                    sellDex: crossDex.sellDex,
+                    profitBps: crossDex.grossProfitBps,
+                  },
+                  "DRY RUN: cross-DEX arb found"
+                );
+              }
+              // TODO: Build cross-DEX execution path (buy on one DEX, sell on another)
+            }
+          } catch (err) {
+            this.logger.debug(
+              { pair, error: (err as Error).message },
+              "Cross-DEX scan error"
+            );
           }
         }
 
