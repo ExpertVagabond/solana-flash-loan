@@ -13,17 +13,43 @@ const DEX_PROGRAMS = {
   meteoraAmm: new PublicKey("Eo7WjKq67rjJQSZxS6z3YkapzY3eBj6xfkMa2AERjo2G"),
 } as const;
 
-// Instruction discriminators for pool creation events (first 8 bytes of ix data)
-const POOL_INIT_KEYWORDS = [
-  "initialize",
-  "create_pool",
-  "open_position",
-  "init_pool",
-  "initialize_pool",
-  "create_amm",
-  "Initialize2", // Raydium v4
-  "initializeReward", // CLMM
+// Log patterns that indicate pool/position creation (not regular swaps)
+const POOL_INIT_PATTERNS = [
+  "initialize2",          // Raydium v4 pool init
+  "create_pool",          // Generic pool creation
+  "init_pool",            // Raydium CPMM
+  "initialize_pool",      // Orca Whirlpool
+  "InitializePool",       // Orca variant
+  "InitializeLbPair",     // Meteora DLMM
+  "initialize_lb_pair",   // Meteora variant
+  "CreatePool",           // Raydium CLMM
+  "create_amm_config",    // Raydium AMM config
+  "Instruction: InitializePool", // Full Orca log prefix
 ];
+
+// Well-known program addresses to exclude from mint extraction
+const EXCLUDED_ADDRESSES = new Set([
+  // System programs
+  "11111111111111111111111111111111",
+  "ComputeBudget111111111111111111111111111111",
+  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+  "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+  "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+  "SysvarRent111111111111111111111111111111111",
+  "SysvarC1ock11111111111111111111111111111111",
+  "SysvarS1otHashes111111111111111111111111111",
+  // DEX program IDs (already monitored — not token mints)
+  "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",   // Raydium v4
+  "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",    // Raydium CLMM
+  "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",    // Raydium CPMM
+  "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",     // Orca
+  "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",     // Meteora DLMM
+  "Eo7WjKq67rjJQSZxS6z3YkapzY3eBj6xfkMa2AERjo2G",    // Meteora AMM
+  // Other common programs
+  "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",     // Jupiter v6
+  "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr",     // Memo
+  "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s",     // Metaplex
+]);
 
 // USDC and SOL mints — pools paired with these are tradeable
 const QUOTE_MINTS = new Set([
@@ -148,10 +174,10 @@ export class NewPoolMonitor {
   private handleProgramLogs(dexName: string, logs: Logs): void {
     if (logs.err) return; // Skip failed transactions
 
-    // Check if any log line indicates a pool creation
+    // Check if any log line indicates a pool creation (not regular swaps)
     const isPoolCreation = logs.logs.some((line) =>
-      POOL_INIT_KEYWORDS.some((kw) =>
-        line.toLowerCase().includes(kw.toLowerCase())
+      POOL_INIT_PATTERNS.some((pattern) =>
+        line.includes(pattern)
       )
     );
 
@@ -165,36 +191,14 @@ export class NewPoolMonitor {
     // Most pool init logs include the token mints as base58 pubkeys
     const mints = this.extractMintsFromLogs(logs.logs);
 
-    if (mints.length >= 2) {
-      const event: NewPoolEvent = {
-        dex: dexName,
-        signature: logs.signature,
-        tokenA: mints[0],
-        tokenB: mints[1],
-        timestamp: Date.now(),
-      };
-
-      this.discoveredPools.push(event);
-      this.logger.info(
-        {
-          dex: dexName,
-          tokenA: mints[0].slice(0, 12) + "...",
-          tokenB: mints[1].slice(0, 12) + "...",
-          signature: logs.signature.slice(0, 20) + "...",
-        },
-        "NEW POOL DETECTED (WebSocket)"
+    // Always fetch + parse the full transaction for reliable mint extraction.
+    // Log-based extraction is too noisy (picks up program IDs, system accounts).
+    this.fetchAndParseTransaction(dexName, logs.signature).catch((err) => {
+      this.logger.debug(
+        { sig: logs.signature.slice(0, 16), error: (err as Error).message },
+        "Failed to parse pool creation tx"
       );
-
-      this.onNewPool(event);
-    } else {
-      // Couldn't extract mints from logs — fetch the transaction to parse accounts
-      this.fetchAndParseTransaction(dexName, logs.signature).catch((err) => {
-        this.logger.debug(
-          { sig: logs.signature.slice(0, 16), error: (err as Error).message },
-          "Failed to parse pool creation tx"
-        );
-      });
-    }
+    });
   }
 
   private extractMintsFromLogs(logs: string[]): string[] {
@@ -203,13 +207,15 @@ export class NewPoolMonitor {
     const candidates: string[] = [];
 
     for (const line of logs) {
+      // Skip "Program XXX invoke/consumed/success" lines — those contain program IDs, not mints
+      if (/^Program [A-Za-z0-9]+ (invoke|consumed|success)/.test(line)) continue;
+
       const matches = line.match(mintRegex);
       if (matches) {
         for (const m of matches) {
-          // Filter: must be 32-44 chars, not a known program ID, not already seen
           if (m.length >= 32 && m.length <= 44 && !candidates.includes(m)) {
-            // Quick check: skip well-known program addresses
-            if (m.startsWith("1111") || m.startsWith("Token") || m.startsWith("Sysvar")) continue;
+            // Skip known program addresses and system accounts
+            if (EXCLUDED_ADDRESSES.has(m)) continue;
             candidates.push(m);
           }
         }
