@@ -2,8 +2,12 @@
 """Solana Flash Loan Arbitrage Bot — Python edition.
 
 Full-stack Python: scanning, transaction building, and execution.
-Uses curl_cffi for Raydium, httpx+Jupiter API key for quotes and swap instructions.
-Executes via Jito block engine or standard RPC.
+Two scanning modes running in parallel:
+  1. Jupiter aggregator quotes (existing) — catches aggregator-level opportunities
+  2. Direct pool monitoring (new) — reads AMM accounts on-chain, compares prices
+     across Raydium CLMM, Raydium v4, Orca Whirlpool, and Meteora DLMM
+
+Optional WebSocket streaming for sub-slot reaction to pool state changes.
 """
 
 import asyncio
@@ -24,6 +28,9 @@ from scanner import PairScanner
 from flash_loan_client import FlashLoanClient, TOKEN_PROGRAM_ID
 from jito_client import JitoClient
 from tx_builder import build_arb_transaction, simulate_transaction
+from pool_registry import PoolRegistry
+from cross_dex_scanner import CrossDexScanner
+from pool_streamer import PoolStreamer
 
 # ── Constants ──
 
@@ -58,12 +65,13 @@ class Metrics:
         self.start_time = time.time()
         self.scan_cycles = 0
         self.opportunities_found = 0
+        self.cross_dex_opps = 0
+        self.ws_updates = 0
         self.successful_arbs = 0
         self.simulation_failures = 0
         self.execution_failures = 0
         self.total_profit = 0
-        self.raydium_quotes = 0
-        self.jupiter_quotes = 0
+        self.pools_tracked = 0
 
     def summary(self) -> str:
         uptime = (time.time() - self.start_time) / 60
@@ -74,10 +82,11 @@ class Metrics:
         )
         return (
             f"uptime={uptime:.1f}m cycles={self.scan_cycles} "
-            f"opps={self.opportunities_found} hit_rate={rate} "
+            f"opps={self.opportunities_found} xdex={self.cross_dex_opps} "
+            f"ws={self.ws_updates} hit_rate={rate} "
             f"arbs={self.successful_arbs} profit={self.total_profit} "
             f"sim_fail={self.simulation_failures} exec_fail={self.execution_failures} "
-            f"ray_quotes={self.raydium_quotes} jup_quotes={self.jupiter_quotes}"
+            f"pools={self.pools_tracked}"
         )
 
 
@@ -114,6 +123,13 @@ class ArbitrageEngine:
         self.borrower_usdc_ata = None
         self.flash_loan: FlashLoanClient | None = None
         self.jito: JitoClient | None = None
+
+        # Cross-DEX scanning (initialized in start())
+        self.pool_registry: PoolRegistry | None = None
+        self.cross_dex_scanner: CrossDexScanner | None = None
+        self.pool_streamer: PoolStreamer | None = None
+        # Track latest pool prices from WebSocket for fast arb detection
+        self._pool_prices: dict[str, float] = {}  # pool_address -> price
 
     async def start(self):
         self.running = True
@@ -163,16 +179,48 @@ class ArbitrageEngine:
             self.jito = JitoClient(region=self.config.jito_region)
             logger.info(f"Jito: {self.jito.endpoint}")
 
+        # 6. Discover pools for cross-DEX scanning
+        self.pool_registry = PoolRegistry(
+            rpc=self.rpc,
+            jupiter_api_key=self.config.jupiter_api_key,
+        )
+        await self._discover_pools()
+
+        # 7. Initialize cross-DEX scanner
+        fee_bps = self.scanner.pool_fee_bps
+        self.cross_dex_scanner = CrossDexScanner(
+            rpc=self.rpc,
+            registry=self.pool_registry,
+            pool_fee_bps=fee_bps,
+            min_spread_bps=15,
+        )
+        self.metrics.pools_tracked = self.pool_registry.total_pools
+
         # Test quote connectivity
         await self._test_raydium()
 
         # Metrics printer
         metrics_task = asyncio.create_task(self._metrics_loop())
 
+        # Start WebSocket streamer in background (if WS URL provided)
+        streamer_task = None
+        if self.config.ws_url:
+            self.pool_streamer = PoolStreamer(
+                ws_url=self.config.ws_url,
+                registry=self.pool_registry,
+                on_pool_update=self._on_pool_update,
+            )
+            streamer_task = asyncio.create_task(self.pool_streamer.start())
+            logger.info("WebSocket pool streamer started")
+
         try:
             await self._scan_loop()
         finally:
             metrics_task.cancel()
+            if streamer_task:
+                if self.pool_streamer:
+                    await self.pool_streamer.stop()
+                streamer_task.cancel()
             await self.quote_provider.close()
             if self.jito:
                 await self.jito.close()
@@ -180,6 +228,49 @@ class ArbitrageEngine:
                 await self.rpc.close()
             logger.info(f"FINAL METRICS: {self.metrics.summary()}")
             logger.info("Bot stopped.")
+
+    async def _discover_pools(self):
+        """Discover AMM pools for all trading pairs via DEX APIs + Jupiter routing."""
+        from tokens import parse_pair
+
+        priority_set = {"SOL/USDC", "MSOL/USDC", "JITOSOL/USDC", "BSOL/USDC",
+                        "JUP/USDC", "TRUMP/USDC", "ORCA/USDC", "INF/USDC"}
+
+        logger.info(f"Discovering pools for {len(self.config.pairs)} pairs...")
+
+        # Phase 1: DEX APIs for priority pairs (find direct pools)
+        for pair in self.config.pairs:
+            if pair not in priority_set:
+                continue
+            try:
+                target_mint, quote_mint = parse_pair(pair)
+                await self.pool_registry.discover_from_dex_apis(
+                    quote_mint, target_mint, pair
+                )
+            except Exception as e:
+                logger.debug(f"DEX API discovery failed for {pair}: {e}")
+
+        # Phase 2: Jupiter routing for all pairs (catches aggregator routes)
+        for pair in self.config.pairs:
+            try:
+                target_mint, quote_mint = parse_pair(pair)
+                await self.pool_registry.discover_pools_for_pair(
+                    quote_mint, target_mint, pair
+                )
+                await asyncio.sleep(2.5)
+            except Exception as e:
+                logger.debug(f"Jupiter discovery failed for {pair}: {e}")
+
+        logger.info(
+            f"Pool discovery complete: {self.pool_registry.total_pools} pools "
+            f"across {self.pool_registry.total_pairs} pairs"
+        )
+
+    def _on_pool_update(self, state, pool_info):
+        """Callback from WebSocket streamer when a pool account changes."""
+        self.metrics.ws_updates += 1
+        if state.price > 0:
+            self._pool_prices[state.pool_address] = state.price
 
     async def _test_raydium(self):
         """Quick connectivity test for Raydium via curl_cffi."""
@@ -223,11 +314,26 @@ class ArbitrageEngine:
                     if not self.running:
                         break
 
-                    # Stagger between pairs: Raydium allows ~1 req/sec sustained
-                    # Each pair = 2 requests (leg1 + leg2), so 1.5s gap keeps us under
+                    # Stagger between pairs
                     if i > 0:
                         await asyncio.sleep(1.5)
 
+                    # ── Mode 1: Cross-DEX pool price comparison (fast, on-chain) ──
+                    if self.cross_dex_scanner:
+                        xdex_opp = await self.cross_dex_scanner.scan_pair(
+                            pair, self.config.borrow_amount
+                        )
+                        if xdex_opp:
+                            self.metrics.cross_dex_opps += 1
+                            logger.info(
+                                f"CROSS-DEX HIT {pair}: {xdex_opp.spread_bps:+d} bps spread, "
+                                f"buy@{xdex_opp.buy_pool.dex} sell@{xdex_opp.sell_pool.dex}"
+                            )
+                            # TODO: Build cross-DEX transaction (swap on specific pools
+                            # instead of through Jupiter aggregator)
+                            # For now, fall through to Jupiter-based execution
+
+                    # ── Mode 2: Jupiter aggregator quotes (fallback) ──
                     opp = await self.scanner.scan_pair(
                         pair, self.config.borrow_amount
                     )

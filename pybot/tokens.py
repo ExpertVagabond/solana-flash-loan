@@ -101,12 +101,24 @@ PAIR_BORROW_OVERRIDES: dict[str, int] = {
 }
 
 
+# Reverse lookup: mint address → decimals
+_MINT_TO_DECIMALS: dict[str, int] = {}
+for _sym, _mint in WELL_KNOWN_MINTS.items():
+    if _sym in TOKEN_DECIMALS:
+        _MINT_TO_DECIMALS[_mint] = TOKEN_DECIMALS[_sym]
+
+
 def resolve_mint(symbol_or_mint: str) -> str:
     return WELL_KNOWN_MINTS.get(symbol_or_mint.upper(), symbol_or_mint)
 
 
 def resolve_decimals(symbol_or_mint: str) -> int:
     return TOKEN_DECIMALS.get(symbol_or_mint.upper(), 6)
+
+
+def decimals_for_mint(mint_address: str) -> int:
+    """Get decimals for a mint address. Returns 6 (USDC default) if unknown."""
+    return _MINT_TO_DECIMALS.get(mint_address, 6)
 
 
 def parse_pair(pair: str) -> tuple[str, str]:
