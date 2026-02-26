@@ -28,7 +28,10 @@ from quote_provider import QuoteProvider
 from scanner import PairScanner
 from flash_loan_client import FlashLoanClient, TOKEN_PROGRAM_ID
 from jito_client import JitoClient
-from tx_builder import build_arb_transaction, simulate_transaction
+from tx_builder import (
+    build_arb_transaction, simulate_transaction,
+    build_triangular_transaction, build_cross_dex_transaction,
+)
 from pool_registry import PoolRegistry
 from cross_dex_scanner import CrossDexScanner
 from pool_streamer import PoolStreamer
@@ -135,6 +138,8 @@ class ArbitrageEngine:
         # Track latest pool prices from WebSocket for fast arb detection
         self._pool_prices: dict[str, float] = {}  # pool_address -> price
         self._ws_arb_queue: asyncio.Queue | None = None  # Queue for WS-triggered arb checks
+        # Triangular batch rotation
+        self._tri_batch_idx: int = 0
 
     async def start(self):
         self.running = True
@@ -205,7 +210,7 @@ class ArbitrageEngine:
             rpc=self.rpc,
             registry=self.pool_registry,
             flash_fee_bps=fee_bps,
-            min_profit_bps=self.config.min_profit_bps,
+            min_profit_bps=2,  # Lower threshold for triangular (catches tighter spreads)
         )
         self.metrics.pools_tracked = self.pool_registry.total_pools
 
@@ -304,10 +309,15 @@ class ArbitrageEngine:
 
         # Cross-pair pools needed for triangular arb (X/SOL pairs)
         triangular_pairs = [
+            # X/SOL cross-pairs for triangular paths
             "JUP/SOL", "RAY/SOL", "ORCA/SOL", "BONK/SOL", "WIF/SOL",
             "MSOL/SOL", "JITOSOL/SOL", "BSOL/SOL", "INF/SOL",
             "TRUMP/SOL", "POPCAT/SOL", "PYTH/SOL", "JTO/SOL",
-            "USDT/USDC", "USDT/SOL",  # Stablecoin arb paths
+            # Stablecoin arb paths
+            "USDT/USDC", "USDT/SOL",
+            # LST cross-arb (depeg routes)
+            "MSOL/JITOSOL", "MSOL/BSOL", "JITOSOL/BSOL",
+            "INF/MSOL", "INF/JITOSOL",
         ]
 
         logger.info(f"Discovering pools for {len(self.config.pairs)} pairs + {len(triangular_pairs)} cross-pairs...")
@@ -478,9 +488,14 @@ class ArbitrageEngine:
                                 f"CROSS-DEX HIT {pair}: {xdex_opp.spread_bps:+d} bps spread, "
                                 f"buy@{xdex_opp.buy_pool.dex} sell@{xdex_opp.sell_pool.dex}"
                             )
-                            # TODO: Build cross-DEX transaction (swap on specific pools
-                            # instead of through Jupiter aggregator)
-                            # For now, fall through to Jupiter-based execution
+                            if xdex_opp.estimated_profit_bps >= 2:
+                                if self.config.dry_run:
+                                    logger.info(
+                                        f"DRY RUN CROSS-DEX: {pair} "
+                                        f"{xdex_opp.estimated_profit_bps:+d} bps"
+                                    )
+                                else:
+                                    await self._execute_cross_dex(xdex_opp)
 
                     # ── Mode 2: Jupiter aggregator quotes (fallback) ──
                     opp = await self.scanner.scan_pair(
@@ -498,26 +513,36 @@ class ArbitrageEngine:
                         else:
                             await self._execute(opp)
 
-                # ── Mode 3: Triangular arb (every 5th cycle) ──
-                if self.triangular_scanner and cycle_count % 5 == 0:
-                    logger.debug("Running triangular scan...")
-                    tri_opps = await self.triangular_scanner.scan_once(
-                        self.config.borrow_amount
+                # ── Mode 3: Triangular arb (rotating batch every cycle) ──
+                if self.triangular_scanner:
+                    # Rebuild graph every 3rd cycle (RPC-heavy)
+                    if cycle_count % 3 == 0:
+                        await self.triangular_scanner.build_graph()
+
+                    # Rotating batch: 10 focus tokens per cycle
+                    from triangular_scanner import GRAPH_TOKENS
+                    from tokens import resolve_mint, WELL_KNOWN_MINTS
+                    all_mints = [resolve_mint(t) for t in GRAPH_TOKENS if t != "USDC"]
+                    start = (self._tri_batch_idx * 10) % len(all_mints)
+                    batch_mints = set(all_mints[start:start + 10])
+                    self._tri_batch_idx += 1
+
+                    tri_opps = await self.triangular_scanner.scan_triangles(
+                        self.config.borrow_amount, focus_mints=batch_mints,
                     )
+                    m2s = {v: k for k, v in WELL_KNOWN_MINTS.items()}
                     for tri in tri_opps:
                         self.metrics.triangular_opps += 1
-                        # TODO: Build triangular transaction
-                        # (3-leg flash loan: borrow → swap1 → swap2 → swap3 → repay)
+                        path_str = "→".join(
+                            m2s.get(m, m[:6]) for m in tri.path
+                        )
                         if self.config.dry_run:
-                            from tokens import WELL_KNOWN_MINTS
-                            m2s = {v: k for k, v in WELL_KNOWN_MINTS.items()}
-                            path_str = "→".join(
-                                m2s.get(m, m[:6]) for m in tri.path
-                            )
                             logger.info(
                                 f"DRY RUN TRIANGLE: {path_str} "
                                 f"net={tri.net_profit_bps:+d} bps"
                             )
+                        else:
+                            await self._execute_triangular(tri)
 
                 self.consecutive_failures = 0
 
@@ -609,6 +634,137 @@ class ArbitrageEngine:
         except Exception as e:
             self.metrics.execution_failures += 1
             logger.error(f"Execution failed for {opp.pair}: {e}")
+
+    async def _execute_triangular(self, opp):
+        """Build, simulate, and send a triangular arb transaction."""
+        from tokens import WELL_KNOWN_MINTS
+        m2s = {v: k for k, v in WELL_KNOWN_MINTS.items()}
+        path_str = "→".join(m2s.get(m, m[:6]) for m in opp.path)
+
+        logger.info(
+            f"EXECUTING TRIANGULAR: {path_str} "
+            f"net={opp.net_profit_bps:+d} bps, "
+            f"borrow={opp.borrow_amount / 1e6:.0f} USDC"
+        )
+
+        try:
+            jito_tip_ix = None
+            if self.jito and self.config.use_jito:
+                tip = max(1_000, min(50_000, opp.net_profit_bps * 100))
+                jito_tip_ix = self.jito.build_tip_instruction(
+                    self.borrower_pk, tip
+                )
+
+            tx, blockhash, last_valid = await build_triangular_transaction(
+                rpc=self.rpc,
+                borrower=self.borrower,
+                borrower_token_account_a=self.borrower_usdc_ata,
+                flash_loan=self.flash_loan,
+                opportunity=opp,
+                jupiter_api_key=self.config.jupiter_api_key,
+                slippage_bps=100,
+                compute_unit_price=50000,
+                compute_unit_limit=600000,
+                jito_tip_ix=jito_tip_ix,
+            )
+
+            success, logs, units = await simulate_transaction(self.rpc, tx)
+            if not success:
+                self.metrics.simulation_failures += 1
+                logger.warning(f"Triangular simulation FAILED: {path_str}")
+                return
+
+            logger.info(f"Triangular simulation OK: {units} CU")
+
+            sig = ""
+            if self.jito and self.config.use_jito:
+                sig = await self.jito.send_transaction(tx)
+            else:
+                resp = await self.rpc.send_transaction(tx)
+                sig = str(resp.value)
+
+            logger.info(f"TRIANGULAR TX SENT: {sig} | {path_str}")
+
+            confirmed = await self._confirm_transaction(sig, last_valid)
+            if confirmed:
+                self.metrics.successful_arbs += 1
+                est_profit = int(opp.borrow_amount * opp.net_profit_bps / 10000)
+                self.metrics.total_profit += est_profit
+                logger.info(
+                    f"TRIANGULAR CONFIRMED: {sig} | ~{est_profit / 1e6:.4f} USDC"
+                )
+            else:
+                self.metrics.execution_failures += 1
+                logger.warning(f"TRIANGULAR EXPIRED: {sig}")
+
+        except Exception as e:
+            self.metrics.execution_failures += 1
+            logger.error(f"Triangular execution failed: {e}")
+
+    async def _execute_cross_dex(self, opp):
+        """Build, simulate, and send a cross-DEX arb transaction."""
+        logger.info(
+            f"EXECUTING CROSS-DEX {opp.pair}: "
+            f"{opp.spread_bps:+d} bps spread, "
+            f"buy@{opp.buy_pool.dex} sell@{opp.sell_pool.dex}, "
+            f"borrow={opp.borrow_amount / 1e6:.0f} USDC"
+        )
+
+        try:
+            jito_tip_ix = None
+            if self.jito and self.config.use_jito:
+                tip = max(1_000, min(50_000, opp.estimated_profit_bps * 100))
+                jito_tip_ix = self.jito.build_tip_instruction(
+                    self.borrower_pk, tip
+                )
+
+            tx, blockhash, last_valid = await build_cross_dex_transaction(
+                rpc=self.rpc,
+                borrower=self.borrower,
+                borrower_token_account_a=self.borrower_usdc_ata,
+                flash_loan=self.flash_loan,
+                opportunity=opp,
+                jupiter_api_key=self.config.jupiter_api_key,
+                slippage_bps=self.config.max_slippage_bps,
+                compute_unit_price=self.config.priority_fee_micro_lamports,
+                compute_unit_limit=self.config.compute_unit_limit,
+                jito_tip_ix=jito_tip_ix,
+            )
+
+            success, logs, units = await simulate_transaction(self.rpc, tx)
+            if not success:
+                self.metrics.simulation_failures += 1
+                logger.warning(f"Cross-DEX simulation FAILED: {opp.pair}")
+                return
+
+            logger.info(f"Cross-DEX simulation OK: {units} CU")
+
+            sig = ""
+            if self.jito and self.config.use_jito:
+                sig = await self.jito.send_transaction(tx)
+            else:
+                resp = await self.rpc.send_transaction(tx)
+                sig = str(resp.value)
+
+            logger.info(f"CROSS-DEX TX SENT: {sig} | {opp.pair}")
+
+            confirmed = await self._confirm_transaction(sig, last_valid)
+            if confirmed:
+                self.metrics.successful_arbs += 1
+                est_profit = int(
+                    opp.borrow_amount * opp.estimated_profit_bps / 10000
+                )
+                self.metrics.total_profit += est_profit
+                logger.info(
+                    f"CROSS-DEX CONFIRMED: {sig} | ~{est_profit / 1e6:.4f} USDC"
+                )
+            else:
+                self.metrics.execution_failures += 1
+                logger.warning(f"CROSS-DEX EXPIRED: {sig}")
+
+        except Exception as e:
+            self.metrics.execution_failures += 1
+            logger.error(f"Cross-DEX execution failed: {e}")
 
     async def _confirm_transaction(self, sig: str, last_valid_block_height: int) -> bool:
         """Poll for transaction confirmation until confirmed or blockhash expires."""

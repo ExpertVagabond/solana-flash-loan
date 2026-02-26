@@ -4,9 +4,11 @@ Builds V0 VersionedTransaction with:
   [compute budget] -> [borrow] -> [swap leg1] -> [swap leg2] -> [repay] -> [jito tip]
 """
 
+import asyncio as _asyncio
 import base64
 from typing import Optional
 
+import httpx
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.instruction import Instruction, AccountMeta
@@ -36,6 +38,70 @@ def _deserialize_jupiter_ix(raw: dict) -> Instruction:
         for a in raw["accounts"]
     ]
     return Instruction(program_id, data, accounts)
+
+
+# DEX name mapping: internal names → Jupiter API labels
+INTERNAL_DEX_TO_JUPITER = {
+    "raydium_clmm": "Raydium CLMM",
+    "orca": "Whirlpool",
+    "meteora": "Meteora DLMM",
+    "raydium_v4": "Raydium",
+}
+
+
+async def _jup_quote(
+    client: httpx.AsyncClient,
+    input_mint: str,
+    output_mint: str,
+    amount: int,
+    slippage_bps: int = 100,
+    max_accounts: int = 20,
+    dexes: Optional[list] = None,
+) -> dict:
+    """Fetch a Jupiter quote with optional DEX filtering."""
+    params = {
+        "inputMint": input_mint,
+        "outputMint": output_mint,
+        "amount": str(amount),
+        "slippageBps": str(slippage_bps),
+        "maxAccounts": str(max_accounts),
+    }
+    if dexes:
+        params["dexes"] = ",".join(dexes)
+    resp = await client.get("https://api.jup.ag/swap/v1/quote", params=params)
+    if resp.status_code != 200:
+        raise Exception(f"Jupiter quote {resp.status_code}: {resp.text[:200]}")
+    return resp.json()
+
+
+async def _jup_swap_ix(
+    client: httpx.AsyncClient,
+    quote: dict,
+    user_pubkey: str,
+) -> dict:
+    """Fetch Jupiter swap instructions from a quote response."""
+    resp = await client.post(
+        "https://api.jup.ag/swap/v1/swap-instructions",
+        json={
+            "quoteResponse": quote,
+            "userPublicKey": user_pubkey,
+            "wrapAndUnwrapSol": True,
+            "dynamicComputeUnitLimit": True,
+            "prioritizationFeeLamports": 0,
+        },
+    )
+    if resp.status_code != 200:
+        raise Exception(f"Jupiter swap-ix {resp.status_code}: {resp.text[:200]}")
+    return resp.json()
+
+
+def _append_swap_ixs(instructions: list, swap_data: dict):
+    """Append setup + swap + cleanup instructions from Jupiter swap response."""
+    for ix_raw in swap_data.get("setupInstructions", []):
+        instructions.append(_deserialize_jupiter_ix(ix_raw))
+    instructions.append(_deserialize_jupiter_ix(swap_data["swapInstruction"]))
+    if swap_data.get("cleanupInstruction"):
+        instructions.append(_deserialize_jupiter_ix(swap_data["cleanupInstruction"]))
 
 
 async def _load_address_lookup_tables(
@@ -246,3 +312,228 @@ async def simulate_transaction(
 
     logger.debug(f"Simulation OK: CU={units}")
     return True, logs, units
+
+
+async def build_triangular_transaction(
+    rpc: AsyncClient,
+    borrower: Keypair,
+    borrower_token_account_a: Pubkey,
+    flash_loan: FlashLoanClient,
+    opportunity,  # TriangularOpportunity (avoid circular import)
+    jupiter_api_key: str = "",
+    slippage_bps: int = 100,
+    compute_unit_price: int = 50000,
+    compute_unit_limit: int = 600000,
+    jito_tip_ix: Optional[Instruction] = None,
+) -> tuple:
+    """Build 3-leg triangular arb: Borrow -> Swap1 -> Swap2 -> Swap3 -> Repay.
+
+    Sequential quotes (each leg depends on previous output), then parallel
+    swap instruction fetches for speed. Returns (tx, blockhash, last_valid).
+    """
+    borrower_pk = borrower.pubkey()
+    jup_headers = {"x-api-key": jupiter_api_key} if jupiter_api_key else {}
+
+    async with httpx.AsyncClient(headers=jup_headers, timeout=15.0) as client:
+        # Sequential quotes: each leg amount depends on previous output
+        q1 = await _jup_quote(
+            client, opportunity.path[0], opportunity.path[1],
+            opportunity.borrow_amount, slippage_bps,
+        )
+        q2 = await _jup_quote(
+            client, opportunity.path[1], opportunity.path[2],
+            int(q1["outAmount"]), slippage_bps,
+        )
+        q3 = await _jup_quote(
+            client, opportunity.path[2], opportunity.path[3],
+            int(q2["outAmount"]), slippage_bps,
+        )
+
+        # Live profitability check
+        final_out = int(q3["outAmount"])
+        flash_fee = (opportunity.borrow_amount * 9 + 9999) // 10000
+        min_needed = opportunity.borrow_amount + flash_fee
+        if final_out <= min_needed:
+            raise Exception(
+                f"Triangular stale: out={final_out}, needed>{min_needed}, "
+                f"shortfall={min_needed - final_out}"
+            )
+
+        live_profit_bps = int(
+            (final_out - min_needed) / opportunity.borrow_amount * 10000
+        )
+        logger.info(
+            f"Triangular live: {live_profit_bps:+d} bps "
+            f"(scanner: {opportunity.net_profit_bps:+d} bps)"
+        )
+
+        # Parallel swap instruction fetches
+        user_pk = str(borrower_pk)
+        swap1, swap2, swap3 = await _asyncio.gather(
+            _jup_swap_ix(client, q1, user_pk),
+            _jup_swap_ix(client, q2, user_pk),
+            _jup_swap_ix(client, q3, user_pk),
+        )
+
+    # Assemble: compute budget -> borrow -> 3 swaps -> repay -> tip
+    borrow_ix = flash_loan.build_borrow_ix(
+        borrower_pk, borrower_token_account_a, opportunity.borrow_amount
+    )
+    repay_ix = flash_loan.build_repay_ix(borrower_pk, borrower_token_account_a)
+
+    instructions: list[Instruction] = [
+        set_compute_unit_limit(compute_unit_limit),
+        set_compute_unit_price(compute_unit_price),
+        borrow_ix,
+    ]
+    _append_swap_ixs(instructions, swap1)
+    _append_swap_ixs(instructions, swap2)
+    _append_swap_ixs(instructions, swap3)
+    instructions.append(repay_ix)
+    if jito_tip_ix:
+        instructions.append(jito_tip_ix)
+
+    logger.debug(
+        f"Triangular tx: {len(instructions)} instructions, "
+        f"jito={jito_tip_ix is not None}"
+    )
+
+    # Load ALTs from all 3 swaps
+    alt_addresses = (
+        swap1.get("addressLookupTableAddresses", [])
+        + swap2.get("addressLookupTableAddresses", [])
+        + swap3.get("addressLookupTableAddresses", [])
+    )
+    lookup_tables = await _load_address_lookup_tables(rpc, alt_addresses)
+
+    # Build V0 transaction
+    blockhash_resp = await rpc.get_latest_blockhash("confirmed")
+    blockhash = str(blockhash_resp.value.blockhash)
+    last_valid = blockhash_resp.value.last_valid_block_height
+
+    msg = MessageV0.try_compile(
+        payer=borrower_pk,
+        instructions=instructions,
+        address_lookup_table_accounts=lookup_tables,
+        recent_blockhash=Hash.from_string(blockhash),
+    )
+
+    tx = VersionedTransaction(msg, [borrower])
+    tx_bytes = len(bytes(tx))
+    logger.debug(
+        f"Triangular tx: {tx_bytes} bytes ({tx_bytes/1232*100:.1f}% of max)"
+    )
+
+    if tx_bytes > 1232:
+        raise Exception(f"Triangular tx too large: {tx_bytes} bytes (max 1232)")
+
+    return tx, blockhash, last_valid
+
+
+async def build_cross_dex_transaction(
+    rpc: AsyncClient,
+    borrower: Keypair,
+    borrower_token_account_a: Pubkey,
+    flash_loan: FlashLoanClient,
+    opportunity,  # CrossDexOpportunity (avoid circular import)
+    jupiter_api_key: str = "",
+    slippage_bps: int = 50,
+    compute_unit_price: int = 25000,
+    compute_unit_limit: int = 400000,
+    jito_tip_ix: Optional[Instruction] = None,
+) -> tuple:
+    """Build 2-leg cross-DEX arb with Jupiter DEX filtering.
+
+    Buy on cheap DEX, sell on expensive DEX, within one atomic transaction.
+    Returns (tx, blockhash, last_valid).
+    """
+    borrower_pk = borrower.pubkey()
+    jup_headers = {"x-api-key": jupiter_api_key} if jupiter_api_key else {}
+    buy_jup = INTERNAL_DEX_TO_JUPITER.get(opportunity.buy_pool.dex)
+    sell_jup = INTERNAL_DEX_TO_JUPITER.get(opportunity.sell_pool.dex)
+
+    async with httpx.AsyncClient(headers=jup_headers, timeout=10.0) as client:
+        # Leg 1: Buy target on cheap DEX (USDC -> target)
+        q1 = await _jup_quote(
+            client, opportunity.token_a, opportunity.token_b,
+            opportunity.borrow_amount, slippage_bps,
+            dexes=[buy_jup] if buy_jup else None,
+        )
+
+        # Leg 2: Sell target on expensive DEX (target -> USDC)
+        q2 = await _jup_quote(
+            client, opportunity.token_b, opportunity.token_a,
+            int(q1["outAmount"]), slippage_bps,
+            dexes=[sell_jup] if sell_jup else None,
+        )
+
+        # Profitability check
+        final_out = int(q2["outAmount"])
+        flash_fee = (opportunity.borrow_amount * 9 + 9999) // 10000
+        min_needed = opportunity.borrow_amount + flash_fee
+        if final_out <= min_needed:
+            raise Exception(
+                f"Cross-DEX stale: out={final_out}, needed>{min_needed}"
+            )
+
+        live_bps = int(
+            (final_out - min_needed) / opportunity.borrow_amount * 10000
+        )
+        logger.info(
+            f"Cross-DEX live: {live_bps:+d} bps "
+            f"(scanner: {opportunity.estimated_profit_bps:+d} bps)"
+        )
+
+        # Parallel swap instructions
+        user_pk = str(borrower_pk)
+        swap1, swap2 = await _asyncio.gather(
+            _jup_swap_ix(client, q1, user_pk),
+            _jup_swap_ix(client, q2, user_pk),
+        )
+
+    # Assemble
+    borrow_ix = flash_loan.build_borrow_ix(
+        borrower_pk, borrower_token_account_a, opportunity.borrow_amount
+    )
+    repay_ix = flash_loan.build_repay_ix(borrower_pk, borrower_token_account_a)
+
+    instructions: list[Instruction] = [
+        set_compute_unit_limit(compute_unit_limit),
+        set_compute_unit_price(compute_unit_price),
+        borrow_ix,
+    ]
+    _append_swap_ixs(instructions, swap1)
+    _append_swap_ixs(instructions, swap2)
+    instructions.append(repay_ix)
+    if jito_tip_ix:
+        instructions.append(jito_tip_ix)
+
+    # Load ALTs
+    alt_addresses = (
+        swap1.get("addressLookupTableAddresses", [])
+        + swap2.get("addressLookupTableAddresses", [])
+    )
+    lookup_tables = await _load_address_lookup_tables(rpc, alt_addresses)
+
+    # Build V0 transaction
+    blockhash_resp = await rpc.get_latest_blockhash("confirmed")
+    blockhash = str(blockhash_resp.value.blockhash)
+    last_valid = blockhash_resp.value.last_valid_block_height
+
+    msg = MessageV0.try_compile(
+        payer=borrower_pk,
+        instructions=instructions,
+        address_lookup_table_accounts=lookup_tables,
+        recent_blockhash=Hash.from_string(blockhash),
+    )
+
+    tx = VersionedTransaction(msg, [borrower])
+    tx_bytes = len(bytes(tx))
+    logger.debug(
+        f"Cross-DEX tx: {tx_bytes} bytes ({tx_bytes/1232*100:.1f}% of max)"
+    )
+
+    if tx_bytes > 1232:
+        raise Exception(f"Cross-DEX tx too large: {tx_bytes} bytes (max 1232)")
+
+    return tx, blockhash, last_valid

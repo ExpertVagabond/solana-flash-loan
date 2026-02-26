@@ -83,7 +83,7 @@ class TriangularScanner:
         rpc: AsyncClient,
         registry: PoolRegistry,
         flash_fee_bps: int = 9,
-        min_profit_bps: int = 10,
+        min_profit_bps: int = 2,
     ):
         self.rpc = rpc
         self.registry = registry
@@ -230,7 +230,8 @@ class TriangularScanner:
         )
 
     async def scan_triangles(
-        self, borrow_amount: int = 200_000_000
+        self, borrow_amount: int = 200_000_000,
+        focus_mints: Optional[set] = None,
     ) -> list[TriangularOpportunity]:
         """Find all profitable triangular paths starting/ending at USDC.
 
@@ -249,6 +250,9 @@ class TriangularScanner:
         for edge1 in usdc_edges:
             x_mint = edge1.to_mint
             if x_mint == usdc_mint:
+                continue
+            # Focus filtering: only check triangles through batch tokens
+            if focus_mints and x_mint not in focus_mints:
                 continue
 
             x_edges = self._graph.get(x_mint, [])
