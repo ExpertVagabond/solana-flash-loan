@@ -5,14 +5,14 @@ import { JupiterQuote, JupiterClient } from "./jupiter-client";
  * DEX identifiers — match Jupiter's dex labels for routing.
  * Jupiter supports filtering quotes to specific DEXes via the `dexes` param.
  */
-export type DexId = "Raydium" | "Raydium CLMM" | "Orca" | "Orca (Whirlpools)" | "Meteora" | "Meteora DLMM" | "Lifinity" | "Lifinity V2";
+export type DexId = "Raydium" | "Raydium CLMM" | "Raydium CP" | "Orca V2" | "Whirlpool" | "Meteora" | "Meteora DLMM" | "Lifinity V2";
 
-/** Grouped DEX families for cross-DEX arb comparison */
+/** Grouped DEX families — labels MUST match Jupiter's program-id-to-label */
 export const DEX_FAMILIES: Record<string, DexId[]> = {
-  raydium: ["Raydium", "Raydium CLMM"],
-  orca: ["Orca", "Orca (Whirlpools)"],
+  raydium: ["Raydium", "Raydium CLMM", "Raydium CP"],
+  orca: ["Orca V2", "Whirlpool"],
   meteora: ["Meteora", "Meteora DLMM"],
-  lifinity: ["Lifinity", "Lifinity V2"],
+  lifinity: ["Lifinity V2"],
 };
 
 export interface DexQuote {
@@ -77,14 +77,14 @@ export class MultiDexClient {
     const quotes: DexQuote[] = [];
     const now = Date.now();
 
-    // Query each DEX family in parallel
-    const promises = this.activeDexFamilies.map(async (family) => {
+    // Query each DEX family sequentially (respects shared rate limiter)
+    for (const family of this.activeDexFamilies) {
       // Skip if cooling down
       const cooldownUntil = this.cooldowns.get(family) ?? 0;
-      if (now < cooldownUntil) return null;
+      if (now < cooldownUntil) continue;
 
       const dexIds = DEX_FAMILIES[family];
-      if (!dexIds) return null;
+      if (!dexIds) continue;
 
       try {
         const quote = await this.getJupiterDexQuote(
@@ -96,12 +96,12 @@ export class MultiDexClient {
         );
 
         if (quote && BigInt(quote.outAmount) > 0n) {
-          return {
+          quotes.push({
             dex: family,
             quote,
             outAmount: BigInt(quote.outAmount),
             priceImpactPct: parseFloat(quote.priceImpactPct || "0"),
-          } as DexQuote;
+          });
         }
       } catch (err) {
         const msg = (err as Error).message;
@@ -113,13 +113,6 @@ export class MultiDexClient {
           );
         }
       }
-
-      return null;
-    });
-
-    const results = await Promise.all(promises);
-    for (const r of results) {
-      if (r) quotes.push(r);
     }
 
     // Sort by best output (descending)
@@ -241,6 +234,8 @@ export class MultiDexClient {
     }
 
     const url = `${JUPITER_QUOTE_URL}?${params}`;
+    // Use the shared rate limiter from JupiterClient
+    await this.jupiterClient.rateLimiter.acquire();
     const res = await fetch(url);
 
     if (res.status === 429) {

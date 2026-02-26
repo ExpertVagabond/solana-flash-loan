@@ -5,6 +5,7 @@ import {
   Connection,
 } from "@solana/web3.js";
 import type pino from "pino";
+import { RateLimiter } from "../utils/rate-limiter";
 
 // Jupiter lite API for swap instructions (used only during execution)
 const JUPITER_API_BASE = "https://lite-api.jup.ag/swap/v1";
@@ -77,17 +78,21 @@ function deserializeInstruction(raw: RawInstruction): TransactionInstruction {
 
 export class JupiterClient {
   private logger: pino.Logger;
-  private retryDelayMs = 1000;
-  private maxRetries = 3;
+  private retryDelayMs = 2000;
+  private maxRetries = 1;
   private useRaydiumForQuotes: boolean;
   private jupiterFailCount = 0;
   // Raydium cooldown: pause after rate limit, resume after cooldown expires
   private raydiumCooldownUntil = 0;
   private raydiumCooldownMs = 60_000; // 60s cooldown after rate limit
+  // Global rate limiter shared across all Jupiter calls
+  // Jupiter free tier: 60 req/60s = 1 req/sec. Use 0.8/sec for safety margin.
+  public rateLimiter: RateLimiter;
 
   constructor(logger: pino.Logger, useRaydiumForQuotes = true) {
     this.logger = logger;
     this.useRaydiumForQuotes = useRaydiumForQuotes;
+    this.rateLimiter = new RateLimiter(5, 0.8); // burst of 5, sustained 0.8/sec
   }
 
   /**
@@ -297,7 +302,7 @@ export class JupiterClient {
     return tables;
   }
 
-  /** Fetch with timeout (W-07), retry on 429, and exponential backoff. */
+  /** Fetch with timeout (W-07), rate limiter, retry on 429, and exponential backoff. */
   private async fetchWithRetry(
     url: string,
     init: RequestInit,
@@ -306,6 +311,9 @@ export class JupiterClient {
     let lastError: Error | null = null;
 
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+      // Wait for rate limiter token before making request
+      await this.rateLimiter.acquire();
+
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
