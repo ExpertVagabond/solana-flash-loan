@@ -4,6 +4,7 @@ export interface BotMetrics {
   startTime: number;
   scanCycles: number;
   opportunitiesFound: number;
+  triangularOpportunities: number;
   simulationFailures: number;
   executionFailures: number;
   successfulArbs: number;
@@ -17,6 +18,7 @@ export function createMetrics(): BotMetrics {
     startTime: Date.now(),
     scanCycles: 0,
     opportunitiesFound: 0,
+    triangularOpportunities: 0,
     simulationFailures: 0,
     executionFailures: 0,
     successfulArbs: 0,
@@ -39,6 +41,7 @@ export function printMetricsSummary(metrics: BotMetrics, logger: pino.Logger): v
       uptimeMinutes: uptimeMin,
       scanCycles: metrics.scanCycles,
       opportunitiesFound: metrics.opportunitiesFound,
+      triangularOpportunities: metrics.triangularOpportunities,
       hitRate: `${hitRate}%`,
       successfulArbs: metrics.successfulArbs,
       simulationFailures: metrics.simulationFailures,

@@ -18,8 +18,10 @@ import { FlashLoanClient } from "../providers/flash-loan-client";
 import { PairScanner } from "../monitoring/pair-scanner";
 import {
   buildArbitrageTransaction,
+  buildTriangularTransaction,
   simulateTransaction,
 } from "./transaction-builder";
+import { TriangularScanner, TriangularOpportunity } from "./triangular-scanner";
 import { BotMetrics, printMetricsSummary } from "../utils/metrics";
 import { parsePair } from "../utils/tokens";
 import { ArbitrageOpportunity } from "./profit-calculator";
@@ -39,6 +41,7 @@ export class ArbitrageEngine {
   private jitoClient: JitoClient | null;
   private multiDex: MultiDexClient;
   private oracle: OracleClient;
+  private triangularScanner: TriangularScanner;
   private running = false;
   private consecutiveFailures = 0;
   private metricsIntervalId: ReturnType<typeof setInterval> | null = null;
@@ -68,6 +71,17 @@ export class ArbitrageEngine {
     this.jitoClient = jitoClient;
     this.multiDex = new MultiDexClient(logger, jupiterClient);
     this.oracle = new OracleClient(connection, logger);
+    this.triangularScanner = new TriangularScanner(
+      jupiterClient,
+      9, // pool fee bps (updated in preflight)
+      config.minProfitBps,
+      config.maxSlippageBps,
+      logger,
+      config.priorityFeeMicroLamports,
+      config.computeUnitLimit,
+      config.jitoTipLamports,
+      config.useJito
+    );
   }
 
   async start(): Promise<void> {
@@ -84,6 +98,7 @@ export class ArbitrageEngine {
     this.logger.info(
       {
         pairs: this.config.pairs,
+        triangularRoutes: this.triangularScanner.getRoutes().length,
         borrowAmount: this.config.borrowAmount.toString(),
         minProfitBps: this.config.minProfitBps,
         dryRun: this.config.dryRun,
@@ -144,8 +159,32 @@ export class ArbitrageEngine {
           }
         }
 
-        // Phase 2: Cross-DEX arb scan — only on top 5 tightest-spread pairs
-        // (saves rate budget by not scanning all 37+ pairs across 4 DEXes)
+        // Phase 2: Triangular arbitrage scan (10 routes per cycle, rotating)
+        try {
+          const triOpp = await this.triangularScanner.scan();
+          if (triOpp) {
+            this.metrics.opportunitiesFound++;
+            if (this.config.dryRun) {
+              this.logger.info(
+                {
+                  route: triOpp.route.name,
+                  profitBps: triOpp.profitBps,
+                  expectedProfit: triOpp.expectedProfit.toString(),
+                },
+                "DRY RUN: triangular arb found"
+              );
+            } else {
+              await this.executeTriangularArbitrage(triOpp);
+            }
+          }
+        } catch (err) {
+          this.logger.debug(
+            { error: (err as Error).message },
+            "Triangular scan error"
+          );
+        }
+
+        // Phase 3: Cross-DEX arb scan — top 5 tightest-spread pairs
         const bestPairs = this.scanner.getBestSpreads();
         const sortedPairs = [...bestPairs.entries()]
           .sort((a, b) => b[1].bps - a[1].bps)
@@ -166,18 +205,15 @@ export class ArbitrageEngine {
 
             if (crossDex && crossDex.grossProfitBps >= this.config.minProfitBps) {
               this.metrics.opportunitiesFound++;
-              if (this.config.dryRun) {
-                this.logger.info(
-                  {
-                    pair,
-                    buyDex: crossDex.buyDex,
-                    sellDex: crossDex.sellDex,
-                    profitBps: crossDex.grossProfitBps,
-                  },
-                  "DRY RUN: cross-DEX arb found"
-                );
-              }
-              // TODO: Build cross-DEX execution path (buy on one DEX, sell on another)
+              this.logger.info(
+                {
+                  pair,
+                  buyDex: crossDex.buyDex,
+                  sellDex: crossDex.sellDex,
+                  profitBps: crossDex.grossProfitBps,
+                },
+                "Cross-DEX arb found"
+              );
             }
           } catch (err) {
             this.logger.debug(
@@ -275,13 +311,19 @@ export class ArbitrageEngine {
       );
     }
 
-    // 3. Ensure ATAs exist for all tokens in configured pairs
+    // 3. Ensure ATAs exist for all tokens in configured pairs + triangular routes
     const mints = new Set<string>();
     mints.add(this.config.flashLoanTokenMint);
     for (const pair of this.config.pairs) {
       const [tokenA, tokenB] = parsePair(pair);
       mints.add(tokenA);
       mints.add(tokenB);
+    }
+    // Add all triangular route mints
+    for (const route of this.triangularScanner.getRoutes()) {
+      mints.add(route.tokenA);
+      mints.add(route.tokenB);
+      mints.add(route.tokenC);
     }
 
     if (!this.config.dryRun) {
@@ -379,6 +421,103 @@ export class ArbitrageEngine {
 
     this.ataCache.set(mint, ata);
     return ata;
+  }
+
+  private async executeTriangularArbitrage(
+    opportunity: TriangularOpportunity
+  ): Promise<void> {
+    const borrowerTokenAccountA = await this.ensureAta(opportunity.route.tokenA);
+    // Ensure ATAs for intermediate tokens too
+    await this.ensureAta(opportunity.route.tokenB);
+    await this.ensureAta(opportunity.route.tokenC);
+
+    try {
+      const jitoTipInstruction =
+        this.jitoClient && this.config.useJito
+          ? this.jitoClient.buildTipInstruction(
+              this.wallet.publicKey,
+              this.config.jitoTipLamports
+            )
+          : undefined;
+
+      const { tx, blockhash, lastValidBlockHeight } =
+        await buildTriangularTransaction({
+          connection: this.connection,
+          borrower: this.wallet,
+          borrowerTokenAccountA,
+          flashLoanClient: this.flashLoanClient,
+          jupiterClient: this.jupiterClient,
+          opportunity,
+          computeUnitPrice: this.config.priorityFeeMicroLamports,
+          computeUnitLimit: this.config.computeUnitLimit,
+          logger: this.logger,
+          jitoTipInstruction,
+        });
+
+      // Simulate
+      const sim = await simulateTransaction(this.connection, tx, this.logger);
+      if (!sim.success) {
+        this.metrics.simulationFailures++;
+        this.logger.warn(
+          { route: opportunity.route.name },
+          "Triangular simulation failed"
+        );
+        return;
+      }
+
+      // Send via Jito or RPC
+      let sig: string;
+      if (this.jitoClient && this.config.useJito) {
+        sig = await this.jitoClient.sendTransaction(tx);
+        this.logger.info(
+          { signature: sig, route: opportunity.route.name, via: "jito" },
+          "Triangular tx SENT via Jito"
+        );
+        this.metrics.jitoSubmissions++;
+      } else {
+        sig = await this.connection.sendTransaction(tx, {
+          skipPreflight: true,
+          maxRetries: 2,
+        });
+        this.logger.info(
+          { signature: sig, route: opportunity.route.name, via: "rpc" },
+          "Triangular tx SENT via RPC"
+        );
+      }
+
+      // Confirm
+      const confirmation = await this.connection.confirmTransaction(
+        { signature: sig, blockhash, lastValidBlockHeight },
+        "confirmed"
+      );
+
+      if (confirmation.value.err) {
+        this.metrics.executionFailures++;
+        this.logger.error(
+          { signature: sig, error: confirmation.value.err },
+          "Triangular tx FAILED on-chain"
+        );
+      } else {
+        this.metrics.successfulArbs++;
+        this.metrics.totalProfitLamports += opportunity.expectedProfit;
+        this.logger.info(
+          {
+            signature: sig,
+            route: opportunity.route.name,
+            profitBps: opportunity.profitBps,
+            expectedProfit: opportunity.expectedProfit.toString(),
+            via: this.config.useJito ? "jito" : "rpc",
+          },
+          "TRIANGULAR ARBITRAGE SUCCESS"
+        );
+      }
+    } catch (err) {
+      this.metrics.executionFailures++;
+      this.logger.error(
+        { route: opportunity.route.name, error: (err as Error).message },
+        "Triangular execution failed"
+      );
+    }
   }
 
   private async executeArbitrage(
