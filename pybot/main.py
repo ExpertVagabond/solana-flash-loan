@@ -210,7 +210,7 @@ class ArbitrageEngine:
             rpc=self.rpc,
             registry=self.pool_registry,
             flash_fee_bps=fee_bps,
-            min_profit_bps=2,  # Lower threshold for triangular (catches tighter spreads)
+            min_profit_bps=15,  # Pool graph overestimates by ~100-300 bps; 15 filters noise
         )
         self.metrics.pools_tracked = self.pool_registry.total_pools
 
@@ -256,14 +256,16 @@ class ArbitrageEngine:
             logger.info("Bot stopped.")
 
     async def _ws_arb_loop(self):
-        """Process WebSocket-triggered arb checks.
+        """Process WebSocket-triggered arb checks with execution.
 
         When the streamer detects a significant price move on any pool,
-        we immediately run a proper cross-DEX scan for that pair using
-        the full normalization pipeline. This avoids the raw-price
-        comparison bugs while still reacting within 200-500ms.
+        we immediately:
+          1. Run cross-DEX scan (pool prices, fast)
+          2. Validate with Jupiter quote (executable rate)
+          3. Execute if profitable
         """
         recent_scans: dict[str, float] = {}  # pair -> last_scan_time
+        recent_executions: dict[str, float] = {}  # pair -> last_exec_time
 
         while self.running:
             try:
@@ -283,17 +285,116 @@ class ArbitrageEngine:
                 recent_scans[pair_name] = now
 
                 # Run proper cross-DEX scan with full normalization
-                if self.cross_dex_scanner:
-                    opp = await self.cross_dex_scanner.scan_pair(
-                        pair_name, self.config.borrow_amount
-                    )
-                    if opp:
-                        logger.info(
-                            f"WS-ARB HIT {pair_name}: {opp.spread_bps:+d} bps spread, "
-                            f"buy@{opp.buy_pool.dex}@{opp.buy_price:.4f} "
-                            f"sell@{opp.sell_pool.dex}@{opp.sell_price:.4f}"
+                if not self.cross_dex_scanner:
+                    continue
+
+                opp = await self.cross_dex_scanner.scan_pair(
+                    pair_name, self.config.borrow_amount
+                )
+                if not opp:
+                    continue
+
+                self.metrics.cross_dex_opps += 1
+                logger.info(
+                    f"WS-ARB HIT {pair_name}: {opp.spread_bps:+d} bps spread, "
+                    f"buy@{opp.buy_pool.dex}@{opp.buy_price:.4f} "
+                    f"sell@{opp.sell_pool.dex}@{opp.sell_price:.4f}"
+                )
+
+                # Execution gate: different DEXes, sufficient spread, not too recent
+                if opp.buy_pool.dex == opp.sell_pool.dex:
+                    continue
+                if opp.estimated_profit_bps < 5:
+                    continue
+                last_exec = recent_executions.get(pair_name, 0)
+                if now - last_exec < 10.0:
+                    continue
+
+                # Quick Jupiter quote validation before full execution
+                # This catches false positives from pool price overestimation
+                try:
+                    import httpx
+                    from tokens import resolve_mint, parse_pair
+                    from tx_builder import INTERNAL_DEX_TO_JUPITER
+
+                    token_a_mint, token_b_mint = parse_pair(pair_name)
+                    buy_jup = INTERNAL_DEX_TO_JUPITER.get(opp.buy_pool.dex)
+                    sell_jup = INTERNAL_DEX_TO_JUPITER.get(opp.sell_pool.dex)
+
+                    jup_headers = {}
+                    if self.config.jupiter_api_key:
+                        jup_headers["x-api-key"] = self.config.jupiter_api_key
+
+                    async with httpx.AsyncClient(
+                        headers=jup_headers, timeout=5.0
+                    ) as client:
+                        # Quote leg 1: USDC → target (buy on cheap DEX)
+                        params1 = {
+                            "inputMint": token_a_mint,
+                            "outputMint": token_b_mint,
+                            "amount": str(opp.borrow_amount),
+                            "slippageBps": "50",
+                            "maxAccounts": "30",
+                        }
+                        if buy_jup:
+                            params1["dexes"] = buy_jup
+                        resp1 = await client.get(
+                            "https://api.jup.ag/swap/v1/quote", params=params1
                         )
-                        self.metrics.cross_dex_opps += 1
+                        if resp1.status_code != 200:
+                            continue
+                        q1 = resp1.json()
+
+                        # Quote leg 2: target → USDC (sell on expensive DEX)
+                        params2 = {
+                            "inputMint": token_b_mint,
+                            "outputMint": token_a_mint,
+                            "amount": q1["outAmount"],
+                            "slippageBps": "50",
+                            "maxAccounts": "30",
+                        }
+                        if sell_jup:
+                            params2["dexes"] = sell_jup
+                        resp2 = await client.get(
+                            "https://api.jup.ag/swap/v1/quote", params=params2
+                        )
+                        if resp2.status_code != 200:
+                            continue
+                        q2 = resp2.json()
+
+                    final_out = int(q2["outAmount"])
+                    flash_fee = (opp.borrow_amount * 9 + 9999) // 10000
+                    min_needed = opp.borrow_amount + flash_fee
+                    live_bps = int(
+                        (final_out - min_needed) / opp.borrow_amount * 10000
+                    )
+
+                    if final_out <= min_needed:
+                        logger.debug(
+                            f"WS-ARB {pair_name} Jupiter says stale: "
+                            f"out={final_out}, needed={min_needed}, "
+                            f"live={live_bps:+d} bps vs scanner={opp.estimated_profit_bps:+d}"
+                        )
+                        continue
+
+                    logger.info(
+                        f"WS-ARB JUPITER CONFIRMED {pair_name}: "
+                        f"live={live_bps:+d} bps, "
+                        f"scanner={opp.estimated_profit_bps:+d} bps"
+                    )
+
+                except Exception as e:
+                    logger.debug(f"WS-ARB Jupiter validation error: {e}")
+                    continue
+
+                # Execute!
+                recent_executions[pair_name] = now
+                if self.config.dry_run:
+                    logger.info(
+                        f"DRY RUN WS-ARB: {pair_name} {live_bps:+d} bps"
+                    )
+                else:
+                    await self._execute_cross_dex(opp)
 
             except asyncio.TimeoutError:
                 continue
@@ -488,7 +589,8 @@ class ArbitrageEngine:
                                 f"CROSS-DEX HIT {pair}: {xdex_opp.spread_bps:+d} bps spread, "
                                 f"buy@{xdex_opp.buy_pool.dex} sell@{xdex_opp.sell_pool.dex}"
                             )
-                            if xdex_opp.estimated_profit_bps >= 2:
+                            if (xdex_opp.estimated_profit_bps >= 2
+                                    and xdex_opp.buy_pool.dex != xdex_opp.sell_pool.dex):
                                 if self.config.dry_run:
                                     logger.info(
                                         f"DRY RUN CROSS-DEX: {pair} "
@@ -513,11 +615,12 @@ class ArbitrageEngine:
                         else:
                             await self._execute(opp)
 
-                # ── Mode 3: Triangular arb (rotating batch every cycle) ──
-                if self.triangular_scanner:
-                    # Rebuild graph every 3rd cycle (RPC-heavy)
-                    if cycle_count % 3 == 0:
-                        await self.triangular_scanner.build_graph()
+                # ── Mode 3: Triangular arb (every 5th cycle — expensive, low hit rate) ──
+                # Pool graph rates overestimate by ~100 bps vs Jupiter executable rates.
+                # Run less frequently; WS-triggered fast path is the primary strategy.
+                if self.triangular_scanner and cycle_count % 5 == 0:
+                    # Rebuild graph on triangular cycles
+                    await self.triangular_scanner.build_graph()
 
                     # Rotating batch: 10 focus tokens per cycle
                     from triangular_scanner import GRAPH_TOKENS

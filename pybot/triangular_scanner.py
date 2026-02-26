@@ -83,7 +83,7 @@ class TriangularScanner:
         rpc: AsyncClient,
         registry: PoolRegistry,
         flash_fee_bps: int = 9,
-        min_profit_bps: int = 2,
+        min_profit_bps: int = 15,
     ):
         self.rpc = rpc
         self.registry = registry
@@ -282,9 +282,9 @@ class TriangularScanner:
                     # Compute round-trip rate (product of rates)
                     round_trip = edge1.rate * edge2.rate * edge3.rate
 
-                    # Sanity check: rate > 1.05 (5%) is almost certainly a pricing bug
-                    # Real triangular arb is typically < 1% on liquid markets
-                    if round_trip > 1.05 or round_trip < 0.5:
+                    # Sanity check: rate > 1.5% is almost certainly a pricing bug
+                    # (marginal pool prices overestimate executable rates by 100-300 bps)
+                    if round_trip > 1.015 or round_trip < 0.5:
                         continue
 
                     # Total swap fees (sum of all 3 legs)

@@ -334,29 +334,76 @@ async def build_triangular_transaction(
     borrower_pk = borrower.pubkey()
     jup_headers = {"x-api-key": jupiter_api_key} if jupiter_api_key else {}
 
-    async with httpx.AsyncClient(headers=jup_headers, timeout=15.0) as client:
-        # Sequential quotes: each leg amount depends on previous output
-        q1 = await _jup_quote(
-            client, opportunity.path[0], opportunity.path[1],
-            opportunity.borrow_amount, slippage_bps,
-        )
-        q2 = await _jup_quote(
-            client, opportunity.path[1], opportunity.path[2],
-            int(q1["outAmount"]), slippage_bps,
-        )
-        q3 = await _jup_quote(
-            client, opportunity.path[2], opportunity.path[3],
-            int(q2["outAmount"]), slippage_bps,
-        )
+    # Extract DEX hints from scanner edges to force cross-DEX routing.
+    # Without this, Jupiter freely routes each leg through whatever DEX is
+    # cheapest, which eliminates the cross-DEX price discrepancy.
+    edge_dexes = []
+    if hasattr(opportunity, "edges") and opportunity.edges:
+        for edge in opportunity.edges:
+            jup_dex = INTERNAL_DEX_TO_JUPITER.get(edge.dex)
+            edge_dexes.append([jup_dex] if jup_dex else None)
+    else:
+        edge_dexes = [None, None, None]
 
-        # Live profitability check
+    async with httpx.AsyncClient(headers=jup_headers, timeout=15.0) as client:
+        # Sequential quotes with DEX filtering: each leg forced through
+        # the specific DEX where the scanner detected the price discrepancy
+        try:
+            q1 = await _jup_quote(
+                client, opportunity.path[0], opportunity.path[1],
+                opportunity.borrow_amount, slippage_bps,
+                dexes=edge_dexes[0],
+            )
+        except Exception:
+            # Fallback: no route on that DEX, try unrestricted
+            q1 = await _jup_quote(
+                client, opportunity.path[0], opportunity.path[1],
+                opportunity.borrow_amount, slippage_bps,
+            )
+
+        try:
+            q2 = await _jup_quote(
+                client, opportunity.path[1], opportunity.path[2],
+                int(q1["outAmount"]), slippage_bps,
+                dexes=edge_dexes[1],
+            )
+        except Exception:
+            q2 = await _jup_quote(
+                client, opportunity.path[1], opportunity.path[2],
+                int(q1["outAmount"]), slippage_bps,
+            )
+
+        try:
+            q3 = await _jup_quote(
+                client, opportunity.path[2], opportunity.path[3],
+                int(q2["outAmount"]), slippage_bps,
+                dexes=edge_dexes[2],
+            )
+        except Exception:
+            q3 = await _jup_quote(
+                client, opportunity.path[2], opportunity.path[3],
+                int(q2["outAmount"]), slippage_bps,
+            )
+
+        # Live profitability check with per-leg diagnostics
         final_out = int(q3["outAmount"])
         flash_fee = (opportunity.borrow_amount * 9 + 9999) // 10000
         min_needed = opportunity.borrow_amount + flash_fee
+
+        leg1_out = int(q1["outAmount"])
+        leg2_out = int(q2["outAmount"])
+        leg3_out = final_out
+        dex_str = "→".join(
+            (edge_dexes[i][0] if edge_dexes[i] else "any")
+            for i in range(3)
+        )
+
         if final_out <= min_needed:
             raise Exception(
                 f"Triangular stale: out={final_out}, needed>{min_needed}, "
-                f"shortfall={min_needed - final_out}"
+                f"shortfall={min_needed - final_out}, "
+                f"legs={leg1_out}/{leg2_out}/{leg3_out}, "
+                f"dexes={dex_str}"
             )
 
         live_profit_bps = int(
@@ -364,7 +411,9 @@ async def build_triangular_transaction(
         )
         logger.info(
             f"Triangular live: {live_profit_bps:+d} bps "
-            f"(scanner: {opportunity.net_profit_bps:+d} bps)"
+            f"(scanner: {opportunity.net_profit_bps:+d} bps) "
+            f"legs={leg1_out}/{leg2_out}/{leg3_out} "
+            f"dexes={dex_str}"
         )
 
         # Parallel swap instruction fetches
