@@ -32,6 +32,7 @@ from tx_builder import build_arb_transaction, simulate_transaction
 from pool_registry import PoolRegistry
 from cross_dex_scanner import CrossDexScanner
 from pool_streamer import PoolStreamer
+from triangular_scanner import TriangularScanner
 
 # ── Constants ──
 
@@ -67,6 +68,7 @@ class Metrics:
         self.scan_cycles = 0
         self.opportunities_found = 0
         self.cross_dex_opps = 0
+        self.triangular_opps = 0
         self.ws_updates = 0
         self.successful_arbs = 0
         self.simulation_failures = 0
@@ -84,7 +86,7 @@ class Metrics:
         return (
             f"uptime={uptime:.1f}m cycles={self.scan_cycles} "
             f"opps={self.opportunities_found} xdex={self.cross_dex_opps} "
-            f"ws={self.ws_updates} hit_rate={rate} "
+            f"tri={self.triangular_opps} ws={self.ws_updates} hit_rate={rate} "
             f"arbs={self.successful_arbs} profit={self.total_profit} "
             f"sim_fail={self.simulation_failures} exec_fail={self.execution_failures} "
             f"pools={self.pools_tracked}"
@@ -125,9 +127,10 @@ class ArbitrageEngine:
         self.flash_loan: FlashLoanClient | None = None
         self.jito: JitoClient | None = None
 
-        # Cross-DEX scanning (initialized in start())
+        # Cross-DEX + triangular scanning (initialized in start())
         self.pool_registry: PoolRegistry | None = None
         self.cross_dex_scanner: CrossDexScanner | None = None
+        self.triangular_scanner: TriangularScanner | None = None
         self.pool_streamer: PoolStreamer | None = None
         # Track latest pool prices from WebSocket for fast arb detection
         self._pool_prices: dict[str, float] = {}  # pool_address -> price
@@ -195,6 +198,14 @@ class ArbitrageEngine:
             registry=self.pool_registry,
             pool_fee_bps=fee_bps,
             min_spread_bps=15,
+        )
+
+        # 8. Initialize triangular scanner
+        self.triangular_scanner = TriangularScanner(
+            rpc=self.rpc,
+            registry=self.pool_registry,
+            flash_fee_bps=fee_bps,
+            min_profit_bps=self.config.min_profit_bps,
         )
         self.metrics.pools_tracked = self.pool_registry.total_pools
 
@@ -291,9 +302,17 @@ class ArbitrageEngine:
         priority_set = {"SOL/USDC", "MSOL/USDC", "JITOSOL/USDC", "BSOL/USDC",
                         "JUP/USDC", "TRUMP/USDC", "ORCA/USDC", "INF/USDC"}
 
-        logger.info(f"Discovering pools for {len(self.config.pairs)} pairs...")
+        # Cross-pair pools needed for triangular arb (X/SOL pairs)
+        triangular_pairs = [
+            "JUP/SOL", "RAY/SOL", "ORCA/SOL", "BONK/SOL", "WIF/SOL",
+            "MSOL/SOL", "JITOSOL/SOL", "BSOL/SOL", "INF/SOL",
+            "TRUMP/SOL", "POPCAT/SOL", "PYTH/SOL", "JTO/SOL",
+            "USDT/USDC", "USDT/SOL",  # Stablecoin arb paths
+        ]
 
-        # Phase 1: DEX APIs for priority pairs (find direct pools)
+        logger.info(f"Discovering pools for {len(self.config.pairs)} pairs + {len(triangular_pairs)} cross-pairs...")
+
+        # Phase 1: DEX APIs for priority X/USDC pairs
         for pair in self.config.pairs:
             if pair not in priority_set:
                 continue
@@ -305,13 +324,23 @@ class ArbitrageEngine:
             except Exception as e:
                 logger.debug(f"DEX API discovery failed for {pair}: {e}")
 
-        # Phase 2: Jupiter routing only for pairs without DEX API pools
+        # Phase 2: DEX APIs for X/SOL cross-pairs (triangular paths)
+        for pair in triangular_pairs:
+            try:
+                target_mint, quote_mint = parse_pair(pair)
+                await self.pool_registry.discover_from_dex_apis(
+                    quote_mint, target_mint, pair
+                )
+            except Exception as e:
+                logger.debug(f"DEX API discovery failed for {pair}: {e}")
+
+        # Phase 3: Jupiter routing for remaining pairs
         for pair in self.config.pairs:
             try:
                 target_mint, quote_mint = parse_pair(pair)
                 existing = self.pool_registry.get_pair_pools(quote_mint, target_mint)
                 if existing and len(existing.pools) >= 2:
-                    continue  # Already have enough pools from DEX APIs
+                    continue
                 await self.pool_registry.discover_pools_for_pair(
                     quote_mint, target_mint, pair
                 )
@@ -468,6 +497,27 @@ class ArbitrageEngine:
                             )
                         else:
                             await self._execute(opp)
+
+                # ── Mode 3: Triangular arb (every 5th cycle) ──
+                if self.triangular_scanner and cycle_count % 5 == 0:
+                    logger.debug("Running triangular scan...")
+                    tri_opps = await self.triangular_scanner.scan_once(
+                        self.config.borrow_amount
+                    )
+                    for tri in tri_opps:
+                        self.metrics.triangular_opps += 1
+                        # TODO: Build triangular transaction
+                        # (3-leg flash loan: borrow → swap1 → swap2 → swap3 → repay)
+                        if self.config.dry_run:
+                            from tokens import WELL_KNOWN_MINTS
+                            m2s = {v: k for k, v in WELL_KNOWN_MINTS.items()}
+                            path_str = "→".join(
+                                m2s.get(m, m[:6]) for m in tri.path
+                            )
+                            logger.info(
+                                f"DRY RUN TRIANGLE: {path_str} "
+                                f"net={tri.net_profit_bps:+d} bps"
+                            )
 
                 self.consecutive_failures = 0
 
