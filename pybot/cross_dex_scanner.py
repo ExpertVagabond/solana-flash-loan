@@ -75,37 +75,38 @@ class CrossDexScanner:
                 logger.debug(f"{pair}: only {len(states)} pools, need 2+ for cross-dex")
                 return None
 
-            # Filter pools with valid prices
-            priced = [s for s in states if s.price > 0]
+            # Filter pools with valid prices and non-zero liquidity
+            priced = []
+            for s in states:
+                if s.price <= 0:
+                    continue
+                # Skip CLMM/Whirlpool pools with zero liquidity (uninitialized/drained)
+                if s.dex in ("raydium_clmm", "orca") and s.liquidity == 0:
+                    continue
+                priced.append(s)
+
             if len(priced) < 2:
-                logger.debug(f"{pair}: only {len(priced)} pools with valid prices")
+                logger.debug(f"{pair}: only {len(priced)} pools with valid prices+liquidity")
                 return None
 
-            # Find best buy (lowest price = most target per USDC)
-            # and best sell (highest price = most USDC per target)
-            #
-            # Price is token_b per token_a:
-            #   High price = token_b is cheap relative to token_a
-            #   Low price = token_b is expensive relative to token_a
-            #
-            # For buying target (USDC → target): want HIGH price (get more target per USDC)
-            # For selling target (target → USDC): want LOW price (target is worth more USDC)
-            #
-            # Wait — this depends on the price convention. Let's use:
-            #   price = USDC_per_target (how much USDC one target token costs)
-            #   Buy target: want LOW price (cheaper to buy)
-            #   Sell target: want HIGH price (more USDC when selling)
-
-            # Since pool_decoder stores price as token_b/token_a, we need to know
-            # which token is which. For CLMM/Whirlpool, token_mint_a is the first
-            # mint in the pool. We need to normalize prices to USDC_per_target.
-
+            # Normalize all prices to USDC_per_target for comparison
             normalized = []
             for s in priced:
                 usdc_per_target = self._normalize_price(s, quote_mint, target_mint)
                 if usdc_per_target and usdc_per_target > 0:
                     normalized.append((s, usdc_per_target))
 
+            if len(normalized) < 2:
+                return None
+
+            # Filter out price outliers — pools with broken pricing
+            # If a pool's price is >2x different from the median, it's stale/bugged
+            prices_only = sorted(p for _, p in normalized)
+            median_price = prices_only[len(prices_only) // 2]
+            normalized = [
+                (s, p) for s, p in normalized
+                if 0.5 * median_price <= p <= 2.0 * median_price
+            ]
             if len(normalized) < 2:
                 return None
 
