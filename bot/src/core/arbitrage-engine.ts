@@ -28,6 +28,7 @@ import { ArbitrageOpportunity } from "./profit-calculator";
 import { JitoClient } from "../providers/jito-client";
 import { MultiDexClient, CrossDexOpportunity } from "../providers/multi-dex-client";
 import { OracleClient } from "../providers/oracle-client";
+import { NewPoolMonitor, NewPoolEvent } from "../monitoring/new-pool-monitor";
 
 export class ArbitrageEngine {
   private connection: Connection;
@@ -42,9 +43,13 @@ export class ArbitrageEngine {
   private multiDex: MultiDexClient;
   private oracle: OracleClient;
   private triangularScanner: TriangularScanner;
+  private poolMonitor: NewPoolMonitor | null = null;
   private running = false;
   private consecutiveFailures = 0;
   private metricsIntervalId: ReturnType<typeof setInterval> | null = null;
+
+  // Dynamic pairs discovered at runtime (from new pool monitor)
+  private dynamicPairs: Set<string> = new Set();
 
   // Cache ATAs per mint
   private ataCache: Map<string, PublicKey> = new Map();
@@ -82,6 +87,43 @@ export class ArbitrageEngine {
       config.jitoTipLamports,
       config.useJito
     );
+
+    // New pool monitor — detects fresh listings with pricing dislocations
+    this.poolMonitor = new NewPoolMonitor(
+      connection,
+      logger,
+      jupiterClient,
+      (event: NewPoolEvent) => this.handleNewPool(event)
+    );
+  }
+
+  /** Handle a new pool discovery — add to dynamic scanning if tradeable */
+  private handleNewPool(event: NewPoolEvent): void {
+    const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    const SOL = "So11111111111111111111111111111111111111112";
+    const USDT = "Es9vMFrzaCERmKkowAvqYk93CfNe7VYQEHnRSLTiZSo1";
+
+    // Only add pairs where one side is a known quote token
+    let pairKey: string | null = null;
+    if (event.tokenA === USDC || event.tokenB === USDC) {
+      const other = event.tokenA === USDC ? event.tokenB : event.tokenA;
+      pairKey = `${other.slice(0, 8)}/USDC`;
+    } else if (event.tokenA === SOL || event.tokenB === SOL) {
+      // Can't borrow SOL, but note it for triangular scanning
+      this.logger.debug(
+        { dex: event.dex, tokenA: event.tokenA.slice(0, 8), tokenB: event.tokenB.slice(0, 8) },
+        "New SOL pair — available for triangular routes"
+      );
+      return;
+    }
+
+    if (pairKey && !this.dynamicPairs.has(pairKey) && !this.config.pairs.includes(pairKey)) {
+      this.dynamicPairs.add(pairKey);
+      this.logger.info(
+        { pair: pairKey, dex: event.dex, dynamicPairs: this.dynamicPairs.size },
+        "DYNAMIC PAIR ADDED to scanner"
+      );
+    }
   }
 
   async start(): Promise<void> {
@@ -89,6 +131,11 @@ export class ArbitrageEngine {
 
     // Pre-flight checks
     await this.preflight();
+
+    // Start new pool monitor (WebSocket + DexScreener)
+    if (this.poolMonitor) {
+      await this.poolMonitor.start();
+    }
 
     // Print metrics summary every 60 seconds
     this.metricsIntervalId = setInterval(() => {
@@ -156,6 +203,49 @@ export class ArbitrageEngine {
             }
 
             await this.executeArbitrage(opportunity);
+          }
+        }
+
+        // Phase 1b: Scan dynamically discovered pairs (from new pool monitor)
+        for (const dynPair of this.dynamicPairs) {
+          if (!this.running) break;
+          try {
+            // Dynamic pairs use format "MINT_PREFIX/USDC" — need full mint
+            const parts = dynPair.split("/");
+            if (parts.length !== 2) continue;
+
+            // Find the full mint from discovered pools
+            const pool = this.poolMonitor?.discoveredPools.find(
+              (p) => p.tokenA.startsWith(parts[0]) || p.tokenB.startsWith(parts[0])
+            );
+            if (!pool) continue;
+
+            const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+            const targetMint = pool.tokenA === USDC ? pool.tokenB : pool.tokenA;
+
+            const opportunity = await this.scanner.scanPair(
+              dynPair,
+              USDC,
+              targetMint,
+              20_000_000n // $20 for new/unproven tokens
+            );
+
+            if (opportunity) {
+              this.metrics.opportunitiesFound++;
+              if (this.config.dryRun) {
+                this.logger.info(
+                  { pair: dynPair, profitBps: opportunity.profitBps, source: "new-pool" },
+                  "DRY RUN: new pool arb found"
+                );
+              } else {
+                await this.executeArbitrage(opportunity);
+              }
+            }
+          } catch (err) {
+            this.logger.debug(
+              { pair: dynPair, error: (err as Error).message },
+              "Dynamic pair scan error"
+            );
           }
         }
 
@@ -255,8 +345,12 @@ export class ArbitrageEngine {
 
     // Cleanup
     if (this.metricsIntervalId) clearInterval(this.metricsIntervalId);
+    if (this.poolMonitor) this.poolMonitor.stop();
     printMetricsSummary(this.metrics, this.logger);
-    this.logger.info("Arbitrage engine STOPPED");
+    this.logger.info(
+      { dynamicPairsDiscovered: this.dynamicPairs.size },
+      "Arbitrage engine STOPPED"
+    );
   }
 
   stop(): void {
