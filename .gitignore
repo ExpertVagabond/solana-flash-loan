@@ -9,3 +9,7 @@ bot/.env
 bot/dist
 bot/node_modules
 bot/wallet.json
+# Temp deployment scripts (contain hardcoded RPC keys)
+init-pool.ts
+raydium-swap.ts
+swap-and-init.ts
