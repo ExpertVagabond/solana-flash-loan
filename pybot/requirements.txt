@@ -1,0 +1,7 @@
+solders>=0.26.0
+solana>=0.36.0
+httpx>=0.28.0
+curl_cffi>=0.7.0
+loguru>=0.7.0
+python-dotenv>=1.0.0
+base58>=2.1.0

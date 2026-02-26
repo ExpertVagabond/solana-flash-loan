@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Solana Flash Loan Arbitrage Bot — Python edition.
 
-Uses curl_cffi to bypass Cloudflare on Raydium API (unlimited free quotes).
-Falls back to Jupiter API with API key for quotes and swap instructions.
+Full-stack Python: scanning, transaction building, and execution.
+Uses curl_cffi for Raydium, httpx+Jupiter API key for quotes and swap instructions.
+Executes via Jito block engine or standard RPC.
 """
 
 import asyncio
@@ -12,10 +13,23 @@ import time
 from pathlib import Path
 
 from loguru import logger
+from solders.pubkey import Pubkey
+from solana.rpc.async_api import AsyncClient
+from solana.rpc.commitment import Confirmed
 
 from config import load_config, BotConfig
+from wallet import load_keypair
 from quote_provider import QuoteProvider
 from scanner import PairScanner
+from flash_loan_client import FlashLoanClient, TOKEN_PROGRAM_ID
+from jito_client import JitoClient
+from tx_builder import build_arb_transaction, simulate_transaction
+
+# ── Constants ──
+
+ASSOCIATED_TOKEN_PROGRAM_ID = Pubkey.from_string(
+    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+)
 
 # ── Logging setup ──
 
@@ -26,6 +40,15 @@ logger.add(
     level="DEBUG" if "--verbose" in sys.argv else "INFO",
     colorize=True,
 )
+
+
+def get_associated_token_address(wallet: Pubkey, mint: Pubkey) -> Pubkey:
+    """Derive the associated token address (ATA) for a wallet + mint."""
+    ata, _ = Pubkey.find_program_address(
+        [bytes(wallet), bytes(TOKEN_PROGRAM_ID), bytes(mint)],
+        ASSOCIATED_TOKEN_PROGRAM_ID,
+    )
+    return ata
 
 
 # ── Metrics ──
@@ -53,6 +76,7 @@ class Metrics:
             f"uptime={uptime:.1f}m cycles={self.scan_cycles} "
             f"opps={self.opportunities_found} hit_rate={rate} "
             f"arbs={self.successful_arbs} profit={self.total_profit} "
+            f"sim_fail={self.simulation_failures} exec_fail={self.execution_failures} "
             f"ray_quotes={self.raydium_quotes} jup_quotes={self.jupiter_quotes}"
         )
 
@@ -66,6 +90,7 @@ class ArbitrageEngine:
         self.consecutive_failures = 0
         self.metrics = Metrics()
 
+        # Core providers
         self.quote_provider = QuoteProvider(
             jupiter_api_key=config.jupiter_api_key,
             use_raydium=config.use_raydium,
@@ -82,6 +107,14 @@ class ArbitrageEngine:
             use_jito=config.use_jito,
         )
 
+        # Execution stack (initialized in start())
+        self.rpc: AsyncClient | None = None
+        self.borrower = None
+        self.borrower_pk = None
+        self.borrower_usdc_ata = None
+        self.flash_loan: FlashLoanClient | None = None
+        self.jito: JitoClient | None = None
+
     async def start(self):
         self.running = True
         logger.info("=== Solana Flash Loan Arbitrage Bot (Python) ===")
@@ -90,7 +123,47 @@ class ArbitrageEngine:
         logger.info(f"Jito: {self.config.use_jito} | Raydium: {self.config.use_raydium} | "
                      f"Jupiter key: {'yes' if self.config.jupiter_api_key else 'NO'}")
 
-        # Test Raydium connectivity
+        # 1. Load wallet
+        self.borrower = load_keypair(self.config.wallet_path)
+        self.borrower_pk = self.borrower.pubkey()
+        logger.info(f"Wallet: {self.borrower_pk}")
+
+        # 2. Connect to Solana RPC
+        self.rpc = AsyncClient(self.config.rpc_url, commitment="confirmed")
+        bal_resp = await self.rpc.get_balance(self.borrower_pk)
+        sol_balance = bal_resp.value / 1e9
+        logger.info(f"SOL balance: {sol_balance:.4f}")
+
+        # 3. Derive borrower's USDC ATA
+        usdc_mint = Pubkey.from_string(self.config.flash_loan_token_mint)
+        self.borrower_usdc_ata = get_associated_token_address(self.borrower_pk, usdc_mint)
+        logger.info(f"USDC ATA: {self.borrower_usdc_ata}")
+
+        # 4. Initialize flash loan client
+        self.flash_loan = FlashLoanClient(
+            rpc=self.rpc,
+            program_id=self.config.flash_loan_program_id,
+            token_mint=self.config.flash_loan_token_mint,
+        )
+
+        # Fetch pool state to verify deployment and get fee
+        try:
+            pool_state = await self.flash_loan.get_pool_state()
+            fee_bps = pool_state["fee_bps"]
+            self.scanner.pool_fee_bps = fee_bps
+            logger.info(
+                f"Flash loan pool: {pool_state['total_deposits'] / 1e6:.2f} USDC, "
+                f"fee={fee_bps} bps, active={pool_state['is_active']}"
+            )
+        except Exception as e:
+            logger.warning(f"Could not fetch pool state: {e}")
+
+        # 5. Initialize Jito client (optional)
+        if self.config.use_jito:
+            self.jito = JitoClient(region=self.config.jito_region)
+            logger.info(f"Jito: {self.jito.endpoint}")
+
+        # Test quote connectivity
         await self._test_raydium()
 
         # Metrics printer
@@ -101,6 +174,10 @@ class ArbitrageEngine:
         finally:
             metrics_task.cancel()
             await self.quote_provider.close()
+            if self.jito:
+                await self.jito.close()
+            if self.rpc:
+                await self.rpc.close()
             logger.info(f"FINAL METRICS: {self.metrics.summary()}")
             logger.info("Bot stopped.")
 
@@ -187,14 +264,106 @@ class ArbitrageEngine:
                 await asyncio.sleep(sleep_s)
 
     async def _execute(self, opp):
-        """Execute an arbitrage opportunity (placeholder — needs tx building)."""
-        logger.warning(
-            f"EXECUTE {opp.pair}: {opp.profit_bps:+d} bps — "
-            f"TX building not yet implemented in Python bot"
+        """Build, simulate, and send an arbitrage transaction."""
+        logger.info(
+            f"EXECUTING {opp.pair}: {opp.profit_bps:+d} bps, "
+            f"borrow={opp.borrow_amount / 1e6:.0f} USDC, "
+            f"expected_profit={opp.expected_profit / 1e6:.4f} USDC"
         )
-        # TODO: Build and send transaction via solders/solana-py
-        # For now, the TypeScript bot handles execution
-        # This bot is optimized for fast scanning
+
+        try:
+            # Build Jito tip instruction (only paid on tx success)
+            jito_tip_ix = None
+            if self.jito and self.config.use_jito:
+                jito_tip_ix = self.jito.build_tip_instruction(
+                    self.borrower_pk, self.config.jito_tip_lamports
+                )
+
+            # Build atomic arb transaction
+            tx, blockhash, last_valid = await build_arb_transaction(
+                rpc=self.rpc,
+                borrower=self.borrower,
+                borrower_token_account_a=self.borrower_usdc_ata,
+                flash_loan=self.flash_loan,
+                quote_provider=self.quote_provider,
+                opportunity=opp,
+                slippage_bps=self.config.max_slippage_bps,
+                compute_unit_price=self.config.priority_fee_micro_lamports,
+                compute_unit_limit=self.config.compute_unit_limit,
+                jito_tip_ix=jito_tip_ix,
+            )
+
+            # Simulate first
+            success, logs, units = await simulate_transaction(self.rpc, tx)
+
+            if not success:
+                self.metrics.simulation_failures += 1
+                logger.warning(f"Simulation FAILED for {opp.pair}, skipping")
+                return
+
+            logger.info(f"Simulation OK: {units} CU used")
+
+            # Send transaction
+            sig = ""
+            if self.jito and self.config.use_jito:
+                sig = await self.jito.send_transaction(tx)
+            else:
+                resp = await self.rpc.send_transaction(tx)
+                sig = str(resp.value)
+
+            logger.info(f"TX SENT: {sig} | {opp.pair} {opp.profit_bps:+d} bps")
+
+            # Confirm transaction
+            confirmed = await self._confirm_transaction(sig, last_valid)
+            if confirmed:
+                self.metrics.successful_arbs += 1
+                self.metrics.total_profit += opp.expected_profit
+                logger.info(
+                    f"TX CONFIRMED: {sig} | profit ~{opp.expected_profit / 1e6:.4f} USDC"
+                )
+            else:
+                self.metrics.execution_failures += 1
+                logger.warning(f"TX EXPIRED/FAILED: {sig}")
+
+        except Exception as e:
+            self.metrics.execution_failures += 1
+            logger.error(f"Execution failed for {opp.pair}: {e}")
+
+    async def _confirm_transaction(self, sig: str, last_valid_block_height: int) -> bool:
+        """Poll for transaction confirmation until confirmed or blockhash expires."""
+        from solders.signature import Signature
+
+        signature = Signature.from_string(sig)
+        poll_interval = 2.0  # seconds
+        max_polls = 30  # ~60 seconds max
+
+        for _ in range(max_polls):
+            try:
+                resp = await self.rpc.get_signature_statuses([signature])
+                statuses = resp.value
+                if statuses and statuses[0]:
+                    status = statuses[0]
+                    if status.err:
+                        logger.warning(f"TX failed on-chain: {status.err}")
+                        return False
+                    if status.confirmation_status and str(status.confirmation_status) in (
+                        "confirmed", "finalized"
+                    ):
+                        return True
+
+                # Check if blockhash has expired
+                height_resp = await self.rpc.get_block_height()
+                if height_resp.value > last_valid_block_height:
+                    logger.warning("Blockhash expired before confirmation")
+                    return False
+
+            except Exception as e:
+                logger.debug(f"Confirm poll error: {e}")
+
+            await asyncio.sleep(poll_interval)
+
+        logger.warning("Confirmation timed out")
+        return False
 
     def stop(self):
         self.running = False
