@@ -106,9 +106,9 @@ export class ArbitrageEngine {
           if (!this.running) break;
           const pair = this.config.pairs[i];
 
-          // Stagger pairs by 300ms — Raydium handles this volume fine
+          // Minimal stagger — rate limiter handles API pacing
           if (i > 0) {
-            await new Promise((r) => setTimeout(r, 300));
+            await new Promise((r) => setTimeout(r, 50));
           }
 
           const [targetToken, quoteToken] = parsePair(pair);

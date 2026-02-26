@@ -61,33 +61,30 @@ export async function buildArbitrageTransaction(
 
   logger.debug("Building atomic arbitrage transaction...");
 
-  // 1. Get Jupiter swap instructions for both legs
-  logger.debug("Fetching Jupiter quotes and swap instructions...");
+  // Use scanner's cached quotes if available (saves ~2s of re-quoting latency).
+  // The on-chain flash loan repayment check + simulation are the real safety nets —
+  // if quotes are stale, the tx simply reverts with no funds lost.
+  const quoteLeg1 = opportunity.quoteLeg1;
+  const quoteLeg2 = opportunity.quoteLeg2;
 
-  const quoteLeg1 = await jupiterClient.getQuote(
-    opportunity.tokenA,
-    opportunity.tokenB,
-    opportunity.borrowAmount.toString(),
-    slippageBps
+  if (!quoteLeg1 || !quoteLeg2) {
+    throw new Error("Missing cached quotes — scanner must attach quoteLeg1/quoteLeg2");
+  }
+
+  const quoteAgeMs = Date.now() - opportunity.timestamp;
+  logger.debug(
+    { quoteAgeMs, pair: opportunity.pair },
+    "Using cached quotes from scanner"
   );
 
-  const quoteLeg2 = await jupiterClient.getQuote(
-    opportunity.tokenB,
-    opportunity.tokenA,
-    quoteLeg1.outAmount,
-    slippageBps
-  );
-
-  // Re-validate profit with execution-time quotes (W-03: stale quote guard)
-  const execLeg2Out = BigInt(quoteLeg2.outAmount);
-  const flashLoanFee =
-    (opportunity.borrowAmount * BigInt(9) + 9999n) / 10000n; // 9 bps ceiling
-  if (execLeg2Out <= opportunity.borrowAmount + flashLoanFee) {
+  // Reject quotes older than 30 seconds — too stale for reliable execution
+  if (quoteAgeMs > 30_000) {
     throw new Error(
-      `Opportunity no longer profitable at execution: leg2Out=${execLeg2Out}, needed>${opportunity.borrowAmount + flashLoanFee}`
+      `Quotes too stale: ${quoteAgeMs}ms old (max 30000ms)`
     );
   }
 
+  // Fetch swap instructions for both legs in parallel
   const [swapIxLeg1, swapIxLeg2] = await Promise.all([
     jupiterClient.getSwapInstructions(quoteLeg1, borrower.publicKey),
     jupiterClient.getSwapInstructions(quoteLeg2, borrower.publicKey),

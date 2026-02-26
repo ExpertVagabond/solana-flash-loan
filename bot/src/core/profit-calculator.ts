@@ -12,6 +12,9 @@ export interface ArbitrageOpportunity {
   priceImpactLeg1: string;
   priceImpactLeg2: string;
   timestamp: number;
+  // Cached quotes from scan — passed directly to execution to avoid re-quoting latency
+  quoteLeg1?: any;
+  quoteLeg2?: any;
 }
 
 /**

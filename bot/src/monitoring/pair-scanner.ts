@@ -184,6 +184,10 @@ export class PairScanner {
       this.useJito
     );
 
+    // Cache quotes with opportunity — avoids re-quoting latency in execution
+    opportunity.quoteLeg1 = quoteLeg1;
+    opportunity.quoteLeg2 = quoteLeg2;
+
     if (opportunity.profitBps >= this.minProfitBps) {
       this.logger.info(
         {
@@ -195,6 +199,7 @@ export class PairScanner {
           borrowUsed: borrowAmount.toString(),
           priceImpactLeg1: opportunity.priceImpactLeg1,
           priceImpactLeg2: opportunity.priceImpactLeg2,
+          quoteAgeMs: 0,
         },
         "OPPORTUNITY FOUND"
       );

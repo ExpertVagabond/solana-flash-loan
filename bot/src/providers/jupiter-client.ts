@@ -84,7 +84,7 @@ export class JupiterClient {
   private jupiterFailCount = 0;
   // Raydium cooldown: pause after rate limit, resume after cooldown expires
   private raydiumCooldownUntil = 0;
-  private raydiumCooldownMs = 60_000; // 60s cooldown after rate limit
+  private raydiumCooldownMs = 300_000; // 5min cooldown after rate limit
   // Jupiter API key (Basic tier: 1 RPS free)
   private jupiterApiKey: string | null;
   // Global rate limiter shared across all Jupiter calls
@@ -95,7 +95,7 @@ export class JupiterClient {
     this.logger = logger;
     this.useRaydiumForQuotes = useRaydiumForQuotes;
     this.jupiterApiKey = jupiterApiKey ?? null;
-    this.rateLimiter = new RateLimiter(3, 0.9); // burst of 3, sustained 0.9/sec
+    this.rateLimiter = new RateLimiter(5, 2.0); // burst of 5, sustained 2/sec with API key
     if (this.jupiterApiKey) {
       this.logger.info("Jupiter API key configured");
     } else {
