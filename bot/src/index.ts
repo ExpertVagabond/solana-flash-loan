@@ -82,7 +82,11 @@ async function main(): Promise<void> {
     poolFeeBps,
     config.minProfitBps,
     config.maxSlippageBps,
-    logger
+    logger,
+    config.priorityFeeMicroLamports,
+    config.computeUnitLimit,
+    config.jitoTipLamports,
+    config.useJito
   );
 
   const metrics = createMetrics();

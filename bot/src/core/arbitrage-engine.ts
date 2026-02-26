@@ -81,6 +81,8 @@ export class ArbitrageEngine {
         pollIntervalMs: this.config.pollIntervalMs,
         jito: this.config.useJito,
         jitoTipLamports: this.config.useJito ? this.config.jitoTipLamports : undefined,
+        priorityFee: this.config.priorityFeeMicroLamports,
+        computeUnitLimit: this.config.computeUnitLimit,
       },
       "Arbitrage engine STARTED"
     );
@@ -91,15 +93,25 @@ export class ArbitrageEngine {
       this.metrics.scanCycles++;
 
       try {
-        for (const pair of this.config.pairs) {
+        for (let i = 0; i < this.config.pairs.length; i++) {
           if (!this.running) break;
+          const pair = this.config.pairs[i];
 
-          const [tokenA, tokenB] = parsePair(pair);
+          // Stagger pairs by 2s to spread API load
+          if (i > 0) {
+            await new Promise((r) => setTimeout(r, 2000));
+          }
 
+          const [targetToken, quoteToken] = parsePair(pair);
+
+          // We borrow quoteToken (USDC) via flash loan, so:
+          //   tokenA = quoteToken (flash loan / borrow token)
+          //   tokenB = targetToken (intermediate / swap token)
+          // Flow: borrow USDC -> swap USDC->TARGET -> swap TARGET->USDC -> repay
           const opportunity = await this.scanner.scanPair(
             pair,
-            tokenA,
-            tokenB,
+            quoteToken,
+            targetToken,
             this.config.borrowAmount
           );
 
@@ -112,6 +124,7 @@ export class ArbitrageEngine {
                   pair,
                   profitBps: opportunity.profitBps,
                   expectedProfit: opportunity.expectedProfit.toString(),
+                  solCosts: opportunity.solCostsInToken.toString(),
                 },
                 "DRY RUN: would execute arbitrage"
               );
@@ -284,21 +297,22 @@ export class ArbitrageEngine {
             )
           : undefined;
 
-      // Build the atomic transaction
-      const tx = await buildArbitrageTransaction({
-        connection: this.connection,
-        borrower: this.wallet,
-        borrowerTokenAccountA,
-        borrowerTokenAccountB,
-        flashLoanClient: this.flashLoanClient,
-        jupiterClient: this.jupiterClient,
-        opportunity,
-        slippageBps: this.config.maxSlippageBps,
-        computeUnitPrice: this.config.priorityFeeMicroLamports,
-        computeUnitLimit: this.config.computeUnitLimit,
-        logger: this.logger,
-        jitoTipInstruction,
-      });
+      // Build the atomic transaction — returns blockhash for confirmation (C-04 fix)
+      const { tx, blockhash, lastValidBlockHeight } =
+        await buildArbitrageTransaction({
+          connection: this.connection,
+          borrower: this.wallet,
+          borrowerTokenAccountA,
+          borrowerTokenAccountB,
+          flashLoanClient: this.flashLoanClient,
+          jupiterClient: this.jupiterClient,
+          opportunity,
+          slippageBps: this.config.maxSlippageBps,
+          computeUnitPrice: this.config.priorityFeeMicroLamports,
+          computeUnitLimit: this.config.computeUnitLimit,
+          logger: this.logger,
+          jitoTipInstruction,
+        });
 
       // Simulate first
       const sim = await simulateTransaction(
@@ -329,9 +343,9 @@ export class ArbitrageEngine {
         );
         this.metrics.jitoSubmissions++;
       } else {
-        // Standard RPC path
+        // Standard RPC path — skip preflight since we already simulated (W-05 fix)
         sig = await this.connection.sendTransaction(tx, {
-          skipPreflight: false,
+          skipPreflight: true,
           maxRetries: 2,
         });
 
@@ -341,9 +355,7 @@ export class ArbitrageEngine {
         );
       }
 
-      // Confirm
-      const { blockhash, lastValidBlockHeight } =
-        await this.connection.getLatestBlockhash();
+      // Confirm using the SAME blockhash from build time (C-04 fix)
       const confirmation = await this.connection.confirmTransaction(
         {
           signature: sig,
@@ -371,6 +383,7 @@ export class ArbitrageEngine {
             pair: opportunity.pair,
             profitBps: opportunity.profitBps,
             expectedProfit: opportunity.expectedProfit.toString(),
+            solCosts: opportunity.solCostsInToken.toString(),
             via: this.config.useJito ? "jito" : "rpc",
           },
           "ARBITRAGE SUCCESS"

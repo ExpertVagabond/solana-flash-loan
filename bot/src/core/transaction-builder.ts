@@ -29,15 +29,22 @@ export interface BuildTransactionParams {
   jitoTipInstruction?: TransactionInstruction;
 }
 
+export interface BuildTransactionResult {
+  tx: VersionedTransaction;
+  blockhash: string;
+  lastValidBlockHeight: number;
+}
+
 /**
  * Build the atomic arbitrage transaction:
  *   [compute budget] -> [borrow] -> [swap A->B] -> [swap B->A] -> [repay]
  *
  * Uses VersionedTransaction (V0) with Address Lookup Tables from Jupiter.
+ * Returns the tx AND the blockhash used, so confirmation uses the same one.
  */
 export async function buildArbitrageTransaction(
   params: BuildTransactionParams
-): Promise<VersionedTransaction> {
+): Promise<BuildTransactionResult> {
   const {
     connection,
     borrower,
@@ -70,6 +77,16 @@ export async function buildArbitrageTransaction(
     quoteLeg1.outAmount,
     slippageBps
   );
+
+  // Re-validate profit with execution-time quotes (W-03: stale quote guard)
+  const execLeg2Out = BigInt(quoteLeg2.outAmount);
+  const flashLoanFee =
+    (opportunity.borrowAmount * BigInt(9) + 9999n) / 10000n; // 9 bps ceiling
+  if (execLeg2Out <= opportunity.borrowAmount + flashLoanFee) {
+    throw new Error(
+      `Opportunity no longer profitable at execution: leg2Out=${execLeg2Out}, needed>${opportunity.borrowAmount + flashLoanFee}`
+    );
+  }
 
   const [swapIxLeg1, swapIxLeg2] = await Promise.all([
     jupiterClient.getSwapInstructions(quoteLeg1, borrower.publicKey),
@@ -134,7 +151,7 @@ export async function buildArbitrageTransaction(
     allAltAddresses
   );
 
-  // 5. Build and sign V0 transaction
+  // 5. Build and sign V0 transaction — store blockhash for confirmation (C-04)
   const { blockhash, lastValidBlockHeight } =
     await connection.getLatestBlockhash("confirmed");
 
@@ -165,7 +182,7 @@ export async function buildArbitrageTransaction(
     );
   }
 
-  return tx;
+  return { tx, blockhash, lastValidBlockHeight };
 }
 
 /**

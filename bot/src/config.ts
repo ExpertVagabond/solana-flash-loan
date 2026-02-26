@@ -55,14 +55,14 @@ export function loadConfig(cliOpts: Record<string, any>): BotConfig {
     minProfitBps: Number(cliOpts.minProfitBps || env.MIN_PROFIT_BPS || "5"),
     maxSlippageBps: Number(cliOpts.slippage || env.MAX_SLIPPAGE_BPS || "50"),
     pollIntervalMs: Number(
-      cliOpts.pollInterval || env.POLL_INTERVAL_MS || "2000"
+      cliOpts.pollInterval || env.POLL_INTERVAL_MS || "5000"
     ),
     dryRun: cliOpts.dryRun !== undefined ? cliOpts.dryRun : (env.DRY_RUN !== undefined ? env.DRY_RUN === "true" : true),
     priorityFeeMicroLamports: Number(
-      cliOpts.priorityFee || env.PRIORITY_FEE || "50000"
+      cliOpts.priorityFee || env.PRIORITY_FEE || "25000"
     ),
     computeUnitLimit: Number(
-      cliOpts.computeUnitLimit || env.COMPUTE_UNIT_LIMIT || "600000"
+      cliOpts.computeUnitLimit || env.COMPUTE_UNIT_LIMIT || "400000"
     ),
     maxConsecutiveFailures: Number(
       env.MAX_CONSECUTIVE_FAILURES || "10"

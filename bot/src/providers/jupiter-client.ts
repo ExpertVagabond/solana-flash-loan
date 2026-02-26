@@ -6,7 +6,10 @@ import {
 } from "@solana/web3.js";
 import type pino from "pino";
 
+// Jupiter lite API for swap instructions (used only during execution)
 const JUPITER_API_BASE = "https://lite-api.jup.ag/swap/v1";
+// Raydium API for quotes (no rate limit, used during scanning)
+const RAYDIUM_API_BASE = "https://transaction-v1.raydium.io";
 
 // --- Types ---
 
@@ -76,12 +79,118 @@ export class JupiterClient {
   private logger: pino.Logger;
   private retryDelayMs = 1000;
   private maxRetries = 3;
+  private useRaydiumForQuotes: boolean;
+  private jupiterFailCount = 0;
+  // Raydium cooldown: pause after rate limit, resume after cooldown expires
+  private raydiumCooldownUntil = 0;
+  private raydiumCooldownMs = 60_000; // 60s cooldown after rate limit
 
-  constructor(logger: pino.Logger) {
+  constructor(logger: pino.Logger, useRaydiumForQuotes = true) {
     this.logger = logger;
+    this.useRaydiumForQuotes = useRaydiumForQuotes;
   }
 
+  /**
+   * Get a quote — tries Raydium first (rate-limit-free), falls back to Jupiter.
+   * Raydium quotes are used for scanning; Jupiter is reserved for swap instructions.
+   * Raydium auto-pauses for 60s after a rate limit hit to avoid ban escalation.
+   */
   async getQuote(
+    inputMint: string,
+    outputMint: string,
+    amount: string,
+    slippageBps: number,
+    onlyDirectRoutes = false
+  ): Promise<JupiterQuote> {
+    // Try Raydium first (skip if cooling down from rate limit)
+    if (this.useRaydiumForQuotes && Date.now() > this.raydiumCooldownUntil) {
+      try {
+        return await this.getRaydiumQuote(inputMint, outputMint, amount, slippageBps);
+      } catch (err) {
+        const msg = (err as Error).message;
+        // If rate-limited, activate cooldown
+        if (msg.includes("429") || msg.includes("1015")) {
+          this.raydiumCooldownUntil = Date.now() + this.raydiumCooldownMs;
+          this.logger.warn(
+            { cooldownMs: this.raydiumCooldownMs },
+            "Raydium rate-limited — cooling down, using Jupiter only"
+          );
+        } else {
+          this.logger.debug({ error: msg }, "Raydium quote failed, falling back to Jupiter");
+        }
+      }
+    }
+
+    return this.getJupiterQuote(inputMint, outputMint, amount, slippageBps, onlyDirectRoutes);
+  }
+
+  /** Raydium quote — no rate limit, returns data mapped to JupiterQuote shape */
+  private async getRaydiumQuote(
+    inputMint: string,
+    outputMint: string,
+    amount: string,
+    slippageBps: number
+  ): Promise<JupiterQuote> {
+    const params = new URLSearchParams({
+      inputMint,
+      outputMint,
+      amount,
+      slippageBps: slippageBps.toString(),
+      txVersion: "V0",
+    });
+
+    const url = `${RAYDIUM_API_BASE}/compute/swap-base-in?${params}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`Raydium ${res.status}: ${await res.text()}`);
+
+    const json: any = await res.json();
+    if (!json.success || !json.data) {
+      throw new Error(`Raydium quote failed: ${JSON.stringify(json)}`);
+    }
+
+    const d = json.data;
+
+    this.logger.debug(
+      {
+        inputMint: inputMint.slice(0, 8),
+        outputMint: outputMint.slice(0, 8),
+        inAmount: d.inputAmount,
+        outAmount: d.outputAmount,
+        priceImpact: d.priceImpactPct?.toString() ?? "0",
+        routes: d.routePlan?.length ?? 0,
+        via: "raydium",
+      },
+      "Quote"
+    );
+
+    // Map to JupiterQuote shape for compatibility
+    return {
+      inputMint: d.inputMint,
+      inAmount: d.inputAmount,
+      outputMint: d.outputMint,
+      outAmount: d.outputAmount,
+      otherAmountThreshold: d.otherAmountThreshold,
+      swapMode: "ExactIn",
+      slippageBps,
+      priceImpactPct: d.priceImpactPct?.toString() ?? "0",
+      routePlan: (d.routePlan || []).map((r: any) => ({
+        swapInfo: {
+          ammKey: r.poolId || "",
+          label: "raydium",
+          inputMint: r.inputMint || inputMint,
+          outputMint: r.outputMint || outputMint,
+          inAmount: amount,
+          outAmount: d.outputAmount,
+          feeAmount: "0",
+          feeMint: inputMint,
+        },
+        percent: 100,
+      })),
+    };
+  }
+
+  /** Original Jupiter quote */
+  private async getJupiterQuote(
     inputMint: string,
     outputMint: string,
     amount: string,
@@ -94,7 +203,7 @@ export class JupiterClient {
       amount,
       slippageBps: slippageBps.toString(),
       ...(onlyDirectRoutes ? { onlyDirectRoutes: "true" } : {}),
-      maxAccounts: "40", // keep transaction size manageable
+      maxAccounts: "40",
     });
 
     const url = `${JUPITER_API_BASE}/quote?${params}`;
@@ -112,8 +221,9 @@ export class JupiterClient {
         outAmount: data.outAmount,
         priceImpact: data.priceImpactPct,
         routes: data.routePlan?.length ?? 0,
+        via: "jupiter",
       },
-      "Jupiter quote"
+      "Quote"
     );
 
     return data as JupiterQuote;
@@ -187,21 +297,29 @@ export class JupiterClient {
     return tables;
   }
 
+  /** Fetch with timeout (W-07), retry on 429, and exponential backoff. */
   private async fetchWithRetry(
     url: string,
-    init: RequestInit
+    init: RequestInit,
+    timeoutMs: number = 8000
   ): Promise<any> {
     let lastError: Error | null = null;
 
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
       try {
-        const res = await fetch(url, init);
+        const res = await fetch(url, {
+          ...init,
+          signal: controller.signal,
+        });
 
         if (res.status === 429) {
           const delay = this.retryDelayMs * 2 ** attempt;
           this.logger.warn(
             { attempt, delayMs: delay },
-            "Jupiter rate limited, backing off"
+            "Rate limited, backing off"
           );
           await new Promise((r) => setTimeout(r, delay));
           continue;
@@ -209,23 +327,28 @@ export class JupiterClient {
 
         if (!res.ok) {
           const text = await res.text();
-          throw new Error(`Jupiter API ${res.status}: ${text}`);
+          throw new Error(`API ${res.status}: ${text}`);
         }
 
         return await res.json();
       } catch (err) {
         lastError = err as Error;
+        if (lastError.name === "AbortError") {
+          lastError = new Error(`Request timed out after ${timeoutMs}ms`);
+        }
         if (attempt < this.maxRetries) {
           const delay = this.retryDelayMs * 2 ** attempt;
           this.logger.warn(
             { attempt, error: lastError.message, delayMs: delay },
-            "Jupiter request failed, retrying"
+            "Request failed, retrying"
           );
           await new Promise((r) => setTimeout(r, delay));
         }
+      } finally {
+        clearTimeout(timeout);
       }
     }
 
-    throw lastError ?? new Error("Jupiter request failed after retries");
+    throw lastError ?? new Error("Request failed after retries");
   }
 }
