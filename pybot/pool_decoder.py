@@ -46,6 +46,10 @@ class PoolState:
     reserve_b: int = 0
     tick: int = 0
     fee_rate: int = 0  # in bps or basis points
+    # Fields for raw AMM swap instructions
+    tick_spacing: int = 0
+    amm_config: Optional[Pubkey] = None      # Raydium CLMM only
+    observation_key: Optional[Pubkey] = None  # Raydium CLMM only
 
 
 def _read_pubkey(data: bytes, offset: int) -> str:
@@ -100,12 +104,15 @@ def decode_raydium_clmm(data: bytes, pool_address: str) -> Optional[PoolState]:
     if len(data) < 273:
         return None
 
+    amm_config = Pubkey.from_bytes(data[9:41])
     token_mint_0 = _read_pubkey(data, 73)
     token_mint_1 = _read_pubkey(data, 105)
     token_vault_0 = _read_pubkey(data, 137)
     token_vault_1 = _read_pubkey(data, 169)
+    observation_key = Pubkey.from_bytes(data[201:233])
     decimals_0 = _read_u8(data, 233)
     decimals_1 = _read_u8(data, 234)
+    tick_spacing = _read_u16(data, 235)
     liquidity = _read_u128(data, 237)
     sqrt_price_x64 = _read_u128(data, 253)
     tick_current = _read_i32(data, 269)
@@ -124,6 +131,9 @@ def decode_raydium_clmm(data: bytes, pool_address: str) -> Optional[PoolState]:
         liquidity=liquidity,
         sqrt_price_x64=sqrt_price_x64,
         tick=tick_current,
+        tick_spacing=tick_spacing,
+        amm_config=amm_config,
+        observation_key=observation_key,
     )
 
 
@@ -236,6 +246,7 @@ def decode_orca_whirlpool(data: bytes, pool_address: str) -> Optional[PoolState]
     if len(data) < 245:
         return None
 
+    tick_spacing = _read_u16(data, 41)
     fee_rate = _read_u16(data, 45)
     liquidity = _read_u128(data, 49)
     sqrt_price = _read_u128(data, 65)
@@ -262,6 +273,7 @@ def decode_orca_whirlpool(data: bytes, pool_address: str) -> Optional[PoolState]
         sqrt_price_x64=sqrt_price,
         tick=tick_current,
         fee_rate=fee_rate,  # In hundredths of a bps (1 = 0.0001%)
+        tick_spacing=tick_spacing,
     )
 
 

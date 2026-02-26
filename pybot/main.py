@@ -31,6 +31,7 @@ from jito_client import JitoClient
 from tx_builder import (
     build_arb_transaction, simulate_transaction,
     build_triangular_transaction, build_cross_dex_transaction,
+    build_raw_triangular_transaction,
 )
 from pool_registry import PoolRegistry
 from cross_dex_scanner import CrossDexScanner
@@ -739,15 +740,21 @@ class ArbitrageEngine:
             logger.error(f"Execution failed for {opp.pair}: {e}")
 
     async def _execute_triangular(self, opp):
-        """Build, simulate, and send a triangular arb transaction."""
+        """Build, simulate, and send a triangular arb transaction.
+
+        Strategy: try raw AMM swap instructions first (bypasses Jupiter),
+        fall back to Jupiter-based routing if raw fails (e.g., unsupported DEX).
+        """
         from tokens import WELL_KNOWN_MINTS
         m2s = {v: k for k, v in WELL_KNOWN_MINTS.items()}
         path_str = "→".join(m2s.get(m, m[:6]) for m in opp.path)
+        dex_str = "→".join(e.dex for e in opp.edges) if opp.edges else "?"
 
         logger.info(
             f"EXECUTING TRIANGULAR: {path_str} "
             f"net={opp.net_profit_bps:+d} bps, "
-            f"borrow={opp.borrow_amount / 1e6:.0f} USDC"
+            f"borrow={opp.borrow_amount / 1e6:.0f} USDC, "
+            f"dexes={dex_str}"
         )
 
         try:
@@ -758,26 +765,50 @@ class ArbitrageEngine:
                     self.borrower_pk, tip
                 )
 
-            tx, blockhash, last_valid = await build_triangular_transaction(
-                rpc=self.rpc,
-                borrower=self.borrower,
-                borrower_token_account_a=self.borrower_usdc_ata,
-                flash_loan=self.flash_loan,
-                opportunity=opp,
-                jupiter_api_key=self.config.jupiter_api_key,
-                slippage_bps=100,
-                compute_unit_price=50000,
-                compute_unit_limit=600000,
-                jito_tip_ix=jito_tip_ix,
-            )
+            # Try raw AMM swap first — preserves exact cross-DEX spread
+            tx = None
+            blockhash = None
+            last_valid = None
+            used_raw = False
 
+            try:
+                tx, blockhash, last_valid = await build_raw_triangular_transaction(
+                    rpc=self.rpc,
+                    borrower=self.borrower,
+                    borrower_token_account_a=self.borrower_usdc_ata,
+                    flash_loan=self.flash_loan,
+                    opportunity=opp,
+                    compute_unit_price=50000,
+                    compute_unit_limit=600000,
+                    jito_tip_ix=jito_tip_ix,
+                )
+                used_raw = True
+                logger.info(f"Built RAW triangular tx: {path_str}")
+            except (ValueError, Exception) as raw_err:
+                logger.warning(
+                    f"Raw swap build failed ({raw_err}), falling back to Jupiter"
+                )
+                tx, blockhash, last_valid = await build_triangular_transaction(
+                    rpc=self.rpc,
+                    borrower=self.borrower,
+                    borrower_token_account_a=self.borrower_usdc_ata,
+                    flash_loan=self.flash_loan,
+                    opportunity=opp,
+                    jupiter_api_key=self.config.jupiter_api_key,
+                    slippage_bps=100,
+                    compute_unit_price=50000,
+                    compute_unit_limit=600000,
+                    jito_tip_ix=jito_tip_ix,
+                )
+
+            mode = "RAW" if used_raw else "JUPITER"
             success, logs, units = await simulate_transaction(self.rpc, tx)
             if not success:
                 self.metrics.simulation_failures += 1
-                logger.warning(f"Triangular simulation FAILED: {path_str}")
+                logger.warning(f"Triangular simulation FAILED ({mode}): {path_str}")
                 return
 
-            logger.info(f"Triangular simulation OK: {units} CU")
+            logger.info(f"Triangular simulation OK ({mode}): {units} CU")
 
             sig = ""
             if self.jito and self.config.use_jito:
@@ -786,7 +817,7 @@ class ArbitrageEngine:
                 resp = await self.rpc.send_transaction(tx)
                 sig = str(resp.value)
 
-            logger.info(f"TRIANGULAR TX SENT: {sig} | {path_str}")
+            logger.info(f"TRIANGULAR TX SENT ({mode}): {sig} | {path_str}")
 
             confirmed = await self._confirm_transaction(sig, last_valid)
             if confirmed:
@@ -794,11 +825,11 @@ class ArbitrageEngine:
                 est_profit = int(opp.borrow_amount * opp.net_profit_bps / 10000)
                 self.metrics.total_profit += est_profit
                 logger.info(
-                    f"TRIANGULAR CONFIRMED: {sig} | ~{est_profit / 1e6:.4f} USDC"
+                    f"TRIANGULAR CONFIRMED ({mode}): {sig} | ~{est_profit / 1e6:.4f} USDC"
                 )
             else:
                 self.metrics.execution_failures += 1
-                logger.warning(f"TRIANGULAR EXPIRED: {sig}")
+                logger.warning(f"TRIANGULAR EXPIRED ({mode}): {sig}")
 
         except Exception as e:
             self.metrics.execution_failures += 1

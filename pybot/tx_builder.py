@@ -20,9 +20,13 @@ from solders.compute_budget import set_compute_unit_limit, set_compute_unit_pric
 from solana.rpc.async_api import AsyncClient
 from loguru import logger
 
-from flash_loan_client import FlashLoanClient
+from flash_loan_client import FlashLoanClient, TOKEN_PROGRAM_ID
 from quote_provider import QuoteProvider
 from scanner import ArbitrageOpportunity
+from amm_swap import (
+    build_raw_swap_ix, build_create_ata_idempotent_ix,
+    get_associated_token_address,
+)
 
 
 def _deserialize_jupiter_ix(raw: dict) -> Instruction:
@@ -475,6 +479,148 @@ async def build_triangular_transaction(
 
     if tx_bytes > 1232:
         raise Exception(f"Triangular tx too large: {tx_bytes} bytes (max 1232)")
+
+    return tx, blockhash, last_valid
+
+
+async def build_raw_triangular_transaction(
+    rpc: AsyncClient,
+    borrower: Keypair,
+    borrower_token_account_a: Pubkey,
+    flash_loan: FlashLoanClient,
+    opportunity,  # TriangularOpportunity
+    compute_unit_price: int = 50000,
+    compute_unit_limit: int = 600000,
+    jito_tip_ix: Optional[Instruction] = None,
+) -> tuple:
+    """Build 3-leg triangular arb with raw AMM swap instructions.
+
+    Bypasses Jupiter entirely — builds instructions directly against Orca
+    Whirlpool and Raydium CLMM programs to preserve the exact cross-DEX
+    spread the scanner detected.
+
+    Transaction layout:
+      [compute_budget] -> [borrow] -> [ATA creates] -> [swap1] -> [swap2] -> [swap3] -> [repay] -> [tip]
+
+    Returns (tx, blockhash, last_valid).
+    Raises ValueError if any edge's DEX doesn't support raw swaps.
+    """
+    borrower_pk = borrower.pubkey()
+    edges = opportunity.edges
+    path = opportunity.path  # [USDC, token_x, token_y, USDC]
+
+    # Validate all edges support raw swaps
+    for i, edge in enumerate(edges):
+        if edge.dex not in ("orca", "raydium_clmm"):
+            raise ValueError(
+                f"Leg {i} DEX '{edge.dex}' not supported for raw swaps "
+                f"(pool={edge.pool_address})"
+            )
+
+    # Collect all unique intermediate token mints (not USDC)
+    usdc_mint = path[0]
+    intermediate_mints = set()
+    for mint in path[1:-1]:  # Skip first and last (both USDC)
+        if mint != usdc_mint:
+            intermediate_mints.add(mint)
+
+    # Build ATA creation instructions for intermediate tokens
+    ata_create_ixs = []
+    for mint_str in intermediate_mints:
+        mint_pk = Pubkey.from_string(mint_str)
+        ata_create_ixs.append(
+            build_create_ata_idempotent_ix(borrower_pk, borrower_pk, mint_pk)
+        )
+
+    # Pre-derive all ATAs we'll need
+    ata_cache: dict[str, Pubkey] = {}
+    all_mints = set(path)
+    for mint_str in all_mints:
+        mint_pk = Pubkey.from_string(mint_str)
+        ata_cache[mint_str] = get_associated_token_address(borrower_pk, mint_pk)
+
+    # Build 3 raw swap instructions
+    swap_ixs = []
+    current_amount = opportunity.borrow_amount
+
+    for i, edge in enumerate(edges):
+        pool = edge.pool_state
+        from_mint = edge.from_mint
+        to_mint = edge.to_mint
+
+        # Determine swap direction: a_to_b if from_mint matches pool's token_mint_a
+        a_to_b = (from_mint == pool.token_mint_a)
+
+        token_account_a = ata_cache[pool.token_mint_a]
+        token_account_b = ata_cache[pool.token_mint_b]
+
+        swap_ix = build_raw_swap_ix(
+            pool=pool,
+            payer=borrower_pk,
+            amount_in=current_amount,
+            a_to_b=a_to_b,
+            token_account_a=token_account_a,
+            token_account_b=token_account_b,
+            min_out=0,  # Flash loan repay is the profitability guard
+        )
+        swap_ixs.append(swap_ix)
+
+        # Estimate output for next leg's input
+        fee_mult = 1 - edge.fee_bps / 10000
+        current_amount = int(current_amount * edge.rate * fee_mult)
+
+        logger.debug(
+            f"  Leg {i}: {from_mint[:6]}→{to_mint[:6]} "
+            f"pool={pool.pool_address[:8]} dex={pool.dex} "
+            f"a_to_b={a_to_b} amount_in={swap_ixs[-1].data[8:16]}"
+        )
+
+    # Assemble full instruction sequence
+    borrow_ix = flash_loan.build_borrow_ix(
+        borrower_pk, borrower_token_account_a, opportunity.borrow_amount
+    )
+    repay_ix = flash_loan.build_repay_ix(borrower_pk, borrower_token_account_a)
+
+    instructions: list[Instruction] = [
+        set_compute_unit_limit(compute_unit_limit),
+        set_compute_unit_price(compute_unit_price),
+        borrow_ix,
+    ]
+    instructions.extend(ata_create_ixs)
+    instructions.extend(swap_ixs)
+    instructions.append(repay_ix)
+    if jito_tip_ix:
+        instructions.append(jito_tip_ix)
+
+    n_ix = len(instructions)
+    logger.debug(
+        f"Raw triangular tx: {n_ix} instructions "
+        f"({len(ata_create_ixs)} ATAs, 3 swaps, jito={jito_tip_ix is not None})"
+    )
+
+    # Build V0 transaction (no ALTs needed for raw instructions — all accounts inline)
+    blockhash_resp = await rpc.get_latest_blockhash("confirmed")
+    blockhash = str(blockhash_resp.value.blockhash)
+    last_valid = blockhash_resp.value.last_valid_block_height
+
+    msg = MessageV0.try_compile(
+        payer=borrower_pk,
+        instructions=instructions,
+        address_lookup_table_accounts=[],
+        recent_blockhash=Hash.from_string(blockhash),
+    )
+
+    tx = VersionedTransaction(msg, [borrower])
+    tx_bytes = len(bytes(tx))
+    logger.debug(
+        f"Raw triangular tx: {tx_bytes} bytes ({tx_bytes/1232*100:.1f}% of max)"
+    )
+
+    if tx_bytes > 1232:
+        raise Exception(
+            f"Raw triangular tx too large: {tx_bytes} bytes (max 1232). "
+            f"Consider using Address Lookup Tables."
+        )
 
     return tx, blockhash, last_valid
 
