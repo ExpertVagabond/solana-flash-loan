@@ -160,6 +160,7 @@ export class NewPoolMonitor {
   // --- WebSocket Strategy ---
 
   private async startWebSocketMonitor(): Promise<void> {
+    // Stagger subscriptions to avoid WS rate limits (500ms apart)
     for (const [dexName, programId] of Object.entries(DEX_PROGRAMS)) {
       try {
         const subId = this.connection.onLogs(
@@ -169,10 +170,12 @@ export class NewPoolMonitor {
         );
         this.wsSubscriptions.push(subId);
         this.logger.debug({ dex: dexName, programId: programId.toBase58() }, "Subscribed to program logs");
+        // Stagger to avoid rate limiting
+        await new Promise((r) => setTimeout(r, 500));
       } catch (err) {
         this.logger.warn(
           { dex: dexName, error: (err as Error).message },
-          "Failed to subscribe to program logs"
+          "Failed to subscribe to program logs — continuing without"
         );
       }
     }

@@ -132,9 +132,11 @@ export class ArbitrageEngine {
     // Pre-flight checks
     await this.preflight();
 
-    // Start new pool monitor (WebSocket + DexScreener)
+    // Start new pool monitor (WebSocket + DexScreener) — non-blocking to avoid WS errors stalling startup
     if (this.poolMonitor) {
-      await this.poolMonitor.start();
+      this.poolMonitor.start().catch((err) => {
+        this.logger.warn({ error: (err as Error).message }, "Pool monitor start failed — continuing without");
+      });
     }
 
     // Print metrics summary every 60 seconds
