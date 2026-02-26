@@ -8,12 +8,18 @@ skip-lint = false
 [programs.localnet]
 solana_flash_loan = "2chVPk6DV21qWuyUA2eHAzATdFSHM7ykv1fVX7Gv6nor"
 
+[programs.devnet]
+solana_flash_loan = "2chVPk6DV21qWuyUA2eHAzATdFSHM7ykv1fVX7Gv6nor"
+
 [registry]
 url = "https://api.apr.dev"
 
 [provider]
 cluster = "localnet"
 wallet = "~/.config/solana/id.json"
+
+[test]
+startup_wait = 30000
 
 [scripts]
 test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 \"tests/**/*.ts\""

@@ -54,11 +54,12 @@ pub fn handle_withdraw(ctx: Context<Withdraw>, shares_to_burn: u64) -> Result<()
     let pool = &ctx.accounts.pool;
 
     // Calculate token amount for these shares (includes accrued fees)
-    let amount = shares_to_burn
-        .checked_mul(pool.total_deposits)
+    // Use u128 intermediate to avoid overflow: (shares * deposits) / total_shares
+    let amount = (shares_to_burn as u128)
+        .checked_mul(pool.total_deposits as u128)
         .ok_or(FlashLoanError::MathOverflow)?
-        .checked_div(pool.total_shares)
-        .ok_or(FlashLoanError::MathOverflow)?;
+        .checked_div(pool.total_shares as u128)
+        .ok_or(FlashLoanError::MathOverflow)? as u64;
 
     // PDA signer seeds for vault transfer
     let mint_key = pool.token_mint;

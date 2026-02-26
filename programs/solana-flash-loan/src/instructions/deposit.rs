@@ -53,11 +53,12 @@ pub fn handle_deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
     let shares = if pool.total_shares == 0 {
         amount
     } else {
-        amount
-            .checked_mul(pool.total_shares)
+        // Use u128 intermediate to avoid overflow: (amount * total_shares) / total_deposits
+        (amount as u128)
+            .checked_mul(pool.total_shares as u128)
             .ok_or(FlashLoanError::MathOverflow)?
-            .checked_div(pool.total_deposits)
-            .ok_or(FlashLoanError::MathOverflow)?
+            .checked_div(pool.total_deposits as u128)
+            .ok_or(FlashLoanError::MathOverflow)? as u64
     };
 
     // Transfer tokens from depositor to vault
