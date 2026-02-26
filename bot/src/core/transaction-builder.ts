@@ -25,6 +25,8 @@ export interface BuildTransactionParams {
   computeUnitPrice: number;
   computeUnitLimit: number;
   logger: pino.Logger;
+  // Jito tip (optional — appended as last instruction if provided)
+  jitoTipInstruction?: TransactionInstruction;
 }
 
 /**
@@ -47,6 +49,7 @@ export async function buildArbitrageTransaction(
     computeUnitPrice,
     computeUnitLimit,
     logger,
+    jitoTipInstruction,
   } = params;
 
   logger.debug("Building atomic arbitrage transaction...");
@@ -110,8 +113,13 @@ export async function buildArbitrageTransaction(
     repayIx,
   ];
 
+  // Jito tip goes LAST — after repay, so the bundle tip is only paid on success
+  if (jitoTipInstruction) {
+    instructions.push(jitoTipInstruction);
+  }
+
   logger.debug(
-    { instructionCount: instructions.length },
+    { instructionCount: instructions.length, hasJitoTip: !!jitoTipInstruction },
     "Transaction instructions assembled"
   );
 

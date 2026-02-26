@@ -9,6 +9,7 @@ export interface BotMetrics {
   successfulArbs: number;
   totalProfitLamports: bigint;
   totalGasSpentLamports: bigint;
+  jitoSubmissions: number;
 }
 
 export function createMetrics(): BotMetrics {
@@ -21,6 +22,7 @@ export function createMetrics(): BotMetrics {
     successfulArbs: 0,
     totalProfitLamports: 0n,
     totalGasSpentLamports: 0n,
+    jitoSubmissions: 0,
   };
 }
 
@@ -43,6 +45,7 @@ export function printMetricsSummary(metrics: BotMetrics, logger: pino.Logger): v
       executionFailures: metrics.executionFailures,
       totalProfit: metrics.totalProfitLamports.toString(),
       totalGasSpent: metrics.totalGasSpentLamports.toString(),
+      jitoSubmissions: metrics.jitoSubmissions,
     },
     "METRICS SUMMARY"
   );

@@ -9,6 +9,7 @@ import { JupiterClient } from "./providers/jupiter-client";
 import { FlashLoanClient } from "./providers/flash-loan-client";
 import { PairScanner } from "./monitoring/pair-scanner";
 import { ArbitrageEngine } from "./core/arbitrage-engine";
+import { JitoClient, JitoRegion } from "./providers/jito-client";
 
 const cli = new Command()
   .name("flash-arb")
@@ -26,6 +27,9 @@ const cli = new Command()
   .option("--program-id <pubkey>", "Flash loan program ID")
   .option("--token-mint <pubkey>", "Flash loan token mint")
   .option("--dry-run", "Simulate only, do not send transactions")
+  .option("--jito", "Send transactions via Jito block engine")
+  .option("--jito-region <region>", "Jito region (default, ny, amsterdam, frankfurt, tokyo, slc)")
+  .option("--jito-tip <lamports>", "Jito tip amount in lamports")
   .option("--verbose", "Debug logging")
   .parse();
 
@@ -83,6 +87,16 @@ async function main(): Promise<void> {
 
   const metrics = createMetrics();
 
+  // Initialize Jito client if enabled
+  let jitoClient: JitoClient | null = null;
+  if (config.useJito) {
+    jitoClient = new JitoClient(config.jitoRegion as JitoRegion, logger);
+    logger.info(
+      { region: config.jitoRegion, tipLamports: config.jitoTipLamports },
+      "Jito bundle support ENABLED"
+    );
+  }
+
   // Create and start engine
   const engine = new ArbitrageEngine(
     connection,
@@ -92,7 +106,8 @@ async function main(): Promise<void> {
     jupiterClient,
     scanner,
     metrics,
-    logger
+    logger,
+    jitoClient
   );
 
   // Graceful shutdown

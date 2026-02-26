@@ -20,6 +20,7 @@ import {
 import { BotMetrics, printMetricsSummary } from "../utils/metrics";
 import { parsePair } from "../utils/tokens";
 import { ArbitrageOpportunity } from "./profit-calculator";
+import { JitoClient } from "../providers/jito-client";
 
 export class ArbitrageEngine {
   private connection: Connection;
@@ -30,6 +31,7 @@ export class ArbitrageEngine {
   private scanner: PairScanner;
   private metrics: BotMetrics;
   private logger: pino.Logger;
+  private jitoClient: JitoClient | null;
   private running = false;
   private consecutiveFailures = 0;
   private metricsIntervalId: ReturnType<typeof setInterval> | null = null;
@@ -45,7 +47,8 @@ export class ArbitrageEngine {
     jupiterClient: JupiterClient,
     scanner: PairScanner,
     metrics: BotMetrics,
-    logger: pino.Logger
+    logger: pino.Logger,
+    jitoClient: JitoClient | null = null
   ) {
     this.connection = connection;
     this.wallet = wallet;
@@ -55,6 +58,7 @@ export class ArbitrageEngine {
     this.scanner = scanner;
     this.metrics = metrics;
     this.logger = logger;
+    this.jitoClient = jitoClient;
   }
 
   async start(): Promise<void> {
@@ -75,6 +79,8 @@ export class ArbitrageEngine {
         minProfitBps: this.config.minProfitBps,
         dryRun: this.config.dryRun,
         pollIntervalMs: this.config.pollIntervalMs,
+        jito: this.config.useJito,
+        jitoTipLamports: this.config.useJito ? this.config.jitoTipLamports : undefined,
       },
       "Arbitrage engine STARTED"
     );
@@ -269,6 +275,15 @@ export class ArbitrageEngine {
     const borrowerTokenAccountB = await this.ensureAta(opportunity.tokenB);
 
     try {
+      // Build Jito tip instruction if enabled
+      const jitoTipInstruction =
+        this.jitoClient && this.config.useJito
+          ? this.jitoClient.buildTipInstruction(
+              this.wallet.publicKey,
+              this.config.jitoTipLamports
+            )
+          : undefined;
+
       // Build the atomic transaction
       const tx = await buildArbitrageTransaction({
         connection: this.connection,
@@ -282,6 +297,7 @@ export class ArbitrageEngine {
         computeUnitPrice: this.config.priorityFeeMicroLamports,
         computeUnitLimit: this.config.computeUnitLimit,
         logger: this.logger,
+        jitoTipInstruction,
       });
 
       // Simulate first
@@ -300,25 +316,39 @@ export class ArbitrageEngine {
         return;
       }
 
-      // Send transaction
-      const sig = await this.connection.sendTransaction(tx, {
-        skipPreflight: false,
-        maxRetries: 2,
-      });
+      // Send via Jito or regular RPC
+      let sig: string;
 
-      this.logger.info(
-        { signature: sig, pair: opportunity.pair },
-        "Transaction SENT"
-      );
+      if (this.jitoClient && this.config.useJito) {
+        // Jito path: send single tx directly to block engine
+        sig = await this.jitoClient.sendTransaction(tx);
+
+        this.logger.info(
+          { signature: sig, pair: opportunity.pair, via: "jito" },
+          "Transaction SENT via Jito"
+        );
+        this.metrics.jitoSubmissions++;
+      } else {
+        // Standard RPC path
+        sig = await this.connection.sendTransaction(tx, {
+          skipPreflight: false,
+          maxRetries: 2,
+        });
+
+        this.logger.info(
+          { signature: sig, pair: opportunity.pair, via: "rpc" },
+          "Transaction SENT via RPC"
+        );
+      }
 
       // Confirm
+      const { blockhash, lastValidBlockHeight } =
+        await this.connection.getLatestBlockhash();
       const confirmation = await this.connection.confirmTransaction(
         {
           signature: sig,
-          blockhash: (await this.connection.getLatestBlockhash()).blockhash,
-          lastValidBlockHeight: (
-            await this.connection.getLatestBlockhash()
-          ).lastValidBlockHeight,
+          blockhash,
+          lastValidBlockHeight,
         },
         "confirmed"
       );
@@ -341,6 +371,7 @@ export class ArbitrageEngine {
             pair: opportunity.pair,
             profitBps: opportunity.profitBps,
             expectedProfit: opportunity.expectedProfit.toString(),
+            via: this.config.useJito ? "jito" : "rpc",
           },
           "ARBITRAGE SUCCESS"
         );

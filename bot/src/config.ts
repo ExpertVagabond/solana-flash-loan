@@ -19,6 +19,10 @@ export interface BotConfig {
   computeUnitLimit: number;
   maxConsecutiveFailures: number;
   verbose: boolean;
+  // Jito bundle support
+  useJito: boolean;
+  jitoRegion: string;
+  jitoTipLamports: number;
 }
 
 export function loadConfig(cliOpts: Record<string, any>): BotConfig {
@@ -64,5 +68,9 @@ export function loadConfig(cliOpts: Record<string, any>): BotConfig {
       env.MAX_CONSECUTIVE_FAILURES || "10"
     ),
     verbose: cliOpts.verbose ?? false,
+    // Jito
+    useJito: cliOpts.jito !== undefined ? cliOpts.jito : (env.USE_JITO === "true"),
+    jitoRegion: cliOpts.jitoRegion || env.JITO_REGION || "default",
+    jitoTipLamports: Number(cliOpts.jitoTip || env.JITO_TIP_LAMPORTS || "10000"),
   };
 }
