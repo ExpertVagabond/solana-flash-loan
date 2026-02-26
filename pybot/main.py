@@ -265,10 +265,15 @@ class ArbitrageEngine:
 
     async def _execute(self, opp):
         """Build, simulate, and send an arbitrage transaction."""
+        # Use dynamic fees from the opportunity (scaled to profit margin)
+        cu_price = opp.dynamic_cu_price or self.config.priority_fee_micro_lamports
+        tip_lamports = opp.dynamic_tip_lamports or self.config.jito_tip_lamports
+
         logger.info(
             f"EXECUTING {opp.pair}: {opp.profit_bps:+d} bps, "
             f"borrow={opp.borrow_amount / 1e6:.0f} USDC, "
-            f"expected_profit={opp.expected_profit / 1e6:.4f} USDC"
+            f"expected_profit={opp.expected_profit / 1e6:.4f} USDC, "
+            f"cu_price={cu_price}, tip={tip_lamports}"
         )
 
         try:
@@ -276,7 +281,7 @@ class ArbitrageEngine:
             jito_tip_ix = None
             if self.jito and self.config.use_jito:
                 jito_tip_ix = self.jito.build_tip_instruction(
-                    self.borrower_pk, self.config.jito_tip_lamports
+                    self.borrower_pk, tip_lamports
                 )
 
             # Build atomic arb transaction
@@ -288,7 +293,7 @@ class ArbitrageEngine:
                 quote_provider=self.quote_provider,
                 opportunity=opp,
                 slippage_bps=self.config.max_slippage_bps,
-                compute_unit_price=self.config.priority_fee_micro_lamports,
+                compute_unit_price=cu_price,
                 compute_unit_limit=self.config.compute_unit_limit,
                 jito_tip_ix=jito_tip_ix,
             )

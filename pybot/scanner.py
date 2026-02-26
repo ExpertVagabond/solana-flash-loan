@@ -9,6 +9,7 @@ from loguru import logger
 
 from quote_provider import QuoteProvider, Quote
 from tokens import parse_pair, get_borrow_override
+from fee_strategy import FeeStrategy, FeeParams
 
 
 @dataclass
@@ -26,6 +27,9 @@ class ArbitrageOpportunity:
     price_impact_leg1: float
     price_impact_leg2: float
     source: str  # quote source
+    # Dynamic fee params for execution
+    dynamic_cu_price: int = 0
+    dynamic_tip_lamports: int = 0
 
 
 def calculate_profit(
@@ -38,26 +42,34 @@ def calculate_profit(
     pool_fee_bps: int,
     price_impact_1: float,
     price_impact_2: float,
-    priority_fee_micro: int,
-    compute_units: int,
-    jito_tip: int,
+    fee_strategy: FeeStrategy,
     use_jito: bool,
     source: str,
 ) -> ArbitrageOpportunity:
     # Flash loan fee (ceiling division to match on-chain math)
     fee = (borrow_amount * pool_fee_bps + 9999) // 10000
 
-    # Estimate SOL costs in token_a units using leg1 exchange rate
-    sol_per_token = borrow_amount / max(leg1_out, 1)  # approximate
-    base_fee_lamports = 5000
-    priority_fee_lamports = (priority_fee_micro * compute_units) // 1_000_000
-    jito_fee = jito_tip if use_jito else 0
-    total_sol_lamports = base_fee_lamports + priority_fee_lamports + jito_fee
-    # Rough SOL→token_a conversion: assume SOL price ~$85 → 85_000_000 USDC lamports per SOL
-    sol_cost_in_token = (total_sol_lamports * 85_000_000) // 1_000_000_000
+    # Gross profit before any costs
+    gross = leg2_out - borrow_amount
+
+    # Dynamic fee calculation based on opportunity quality
+    fee_params = fee_strategy.compute_fees(
+        gross_profit_usdc=gross,
+        flash_loan_fee=fee,
+    )
+
+    # SOL cost in USDC lamports
+    sol_cost_in_token = fee_strategy.estimate_sol_cost_usdc(fee_params)
+    if not use_jito:
+        # Without Jito, remove tip from cost estimate
+        no_tip_params = FeeParams(
+            compute_unit_price=fee_params.compute_unit_price,
+            jito_tip_lamports=0,
+            total_sol_cost=fee_strategy._total_sol(fee_params.compute_unit_price, 0),
+        )
+        sol_cost_in_token = fee_strategy.estimate_sol_cost_usdc(no_tip_params)
 
     # Net profit
-    gross = leg2_out - borrow_amount
     net = gross - fee - sol_cost_in_token
     profit_bps = round((net / borrow_amount) * 10000) if borrow_amount > 0 else 0
 
@@ -75,6 +87,8 @@ def calculate_profit(
         price_impact_leg1=price_impact_1,
         price_impact_leg2=price_impact_2,
         source=source,
+        dynamic_cu_price=fee_params.compute_unit_price,
+        dynamic_tip_lamports=fee_params.jito_tip_lamports,
     )
 
 
@@ -94,10 +108,17 @@ class PairScanner:
         self.pool_fee_bps = pool_fee_bps
         self.min_profit_bps = min_profit_bps
         self.slippage_bps = slippage_bps
-        self.priority_fee_micro = priority_fee_micro
-        self.compute_units = compute_units
-        self.jito_tip = jito_tip
         self.use_jito = use_jito
+        # Dynamic fee strategy
+        self.fee_strategy = FeeStrategy(
+            min_tip_lamports=max(1_000, jito_tip // 10),
+            max_tip_lamports=jito_tip * 10,
+            tip_profit_share=0.40,
+            min_cu_price=max(1_000, priority_fee_micro // 10),
+            max_cu_price=priority_fee_micro * 8,
+            base_cu_price=priority_fee_micro,
+            compute_units=compute_units,
+        )
         # Best observed spread per pair
         self.best_spreads: dict[str, tuple[int, float]] = {}  # pair -> (bps, timestamp)
 
@@ -125,8 +146,9 @@ class PairScanner:
             if opp and opp.profit_bps >= self.min_profit_bps:
                 logger.info(
                     f"OPPORTUNITY {pair}: {opp.profit_bps:+d} bps, "
-                    f"profit={opp.expected_profit}, fee={opp.flash_loan_fee}, "
-                    f"borrow={borrow}, via={opp.source}"
+                    f"profit={opp.expected_profit / 1e6:.4f} USDC, "
+                    f"borrow={borrow / 1e6:.0f}, cu={opp.dynamic_cu_price}, "
+                    f"tip={opp.dynamic_tip_lamports}, via={opp.source}"
                 )
                 return opp
 
@@ -169,9 +191,7 @@ class PairScanner:
             pool_fee_bps=self.pool_fee_bps,
             price_impact_1=q1.price_impact_pct,
             price_impact_2=q2.price_impact_pct,
-            priority_fee_micro=self.priority_fee_micro,
-            compute_units=self.compute_units,
-            jito_tip=self.jito_tip,
+            fee_strategy=self.fee_strategy,
             use_jito=self.use_jito,
             source=q1.source,
         )
