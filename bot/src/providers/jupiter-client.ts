@@ -7,9 +7,9 @@ import {
 import type pino from "pino";
 import { RateLimiter } from "../utils/rate-limiter";
 
-// Jupiter lite API for swap instructions (used only during execution)
-const JUPITER_API_BASE = "https://lite-api.jup.ag/swap/v1";
-// Raydium API for quotes (no rate limit, used during scanning)
+// Jupiter API — requires API key (Basic tier: 1 RPS free, Pro: 10+ RPS)
+const JUPITER_API_BASE = "https://api.jup.ag/swap/v1";
+// Raydium API for quotes (generous limits, used for scanning)
 const RAYDIUM_API_BASE = "https://transaction-v1.raydium.io";
 
 // --- Types ---
@@ -85,20 +85,29 @@ export class JupiterClient {
   // Raydium cooldown: pause after rate limit, resume after cooldown expires
   private raydiumCooldownUntil = 0;
   private raydiumCooldownMs = 60_000; // 60s cooldown after rate limit
+  // Jupiter API key (Basic tier: 1 RPS free)
+  private jupiterApiKey: string | null;
   // Global rate limiter shared across all Jupiter calls
-  // Jupiter free tier: 60 req/60s = 1 req/sec. Use 0.8/sec for safety margin.
+  // Jupiter Basic tier: 1 req/sec. Use 0.9/sec for safety margin.
   public rateLimiter: RateLimiter;
 
-  constructor(logger: pino.Logger, useRaydiumForQuotes = true) {
+  constructor(logger: pino.Logger, useRaydiumForQuotes = true, jupiterApiKey?: string) {
     this.logger = logger;
     this.useRaydiumForQuotes = useRaydiumForQuotes;
-    this.rateLimiter = new RateLimiter(5, 0.8); // burst of 5, sustained 0.8/sec
+    this.jupiterApiKey = jupiterApiKey ?? null;
+    this.rateLimiter = new RateLimiter(3, 0.9); // burst of 3, sustained 0.9/sec
+    if (this.jupiterApiKey) {
+      this.logger.info("Jupiter API key configured");
+    } else {
+      this.logger.warn("No Jupiter API key — swap instructions will fail. Get one at jup.ag/api");
+    }
   }
 
   /**
-   * Get a quote — tries Raydium first (rate-limit-free), falls back to Jupiter.
-   * Raydium quotes are used for scanning; Jupiter is reserved for swap instructions.
-   * Raydium auto-pauses for 60s after a rate limit hit to avoid ban escalation.
+   * Get a quote — tries Raydium first (no rate limit), falls back to Jupiter.
+   * Raydium does NOT use the rate limiter (it's a separate API with generous limits).
+   * Jupiter fallback uses rate limiter to stay under 1 req/sec free tier.
+   * Raydium auto-pauses for 60s after a rate limit hit.
    */
   async getQuote(
     inputMint: string,
@@ -129,7 +138,7 @@ export class JupiterClient {
     return this.getJupiterQuote(inputMint, outputMint, amount, slippageBps, onlyDirectRoutes);
   }
 
-  /** Raydium quote — no rate limit, returns data mapped to JupiterQuote shape */
+  /** Raydium quote — generous rate limit, returns data mapped to JupiterQuote shape */
   private async getRaydiumQuote(
     inputMint: string,
     outputMint: string,
@@ -145,12 +154,32 @@ export class JupiterClient {
     });
 
     const url = `${RAYDIUM_API_BASE}/compute/swap-base-in?${params}`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`Raydium ${res.status}: ${await res.text()}`);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        signal: controller.signal,
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+          "Accept": "application/json",
+        },
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      this.logger.debug(
+        { status: res.status, body: text.slice(0, 200), url: url.slice(0, 80) },
+        "Raydium HTTP error"
+      );
+      throw new Error(`Raydium ${res.status}: ${text.slice(0, 200)}`);
+    }
 
     const json: any = await res.json();
     if (!json.success || !json.data) {
-      throw new Error(`Raydium quote failed: ${JSON.stringify(json)}`);
+      throw new Error(`Raydium quote failed: ${JSON.stringify(json).slice(0, 200)}`);
     }
 
     const d = json.data;
@@ -317,9 +346,16 @@ export class JupiterClient {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
+      // Inject Jupiter API key if available
+      const headers = { ...(init.headers as Record<string, string> || {}) };
+      if (this.jupiterApiKey) {
+        headers["x-api-key"] = this.jupiterApiKey;
+      }
+
       try {
         const res = await fetch(url, {
           ...init,
+          headers,
           signal: controller.signal,
         });
 

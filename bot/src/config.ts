@@ -23,6 +23,8 @@ export interface BotConfig {
   useJito: boolean;
   jitoRegion: string;
   jitoTipLamports: number;
+  // Jupiter API key
+  jupiterApiKey?: string;
 }
 
 export function loadConfig(cliOpts: Record<string, any>): BotConfig {
@@ -72,5 +74,6 @@ export function loadConfig(cliOpts: Record<string, any>): BotConfig {
     useJito: cliOpts.jito !== undefined ? cliOpts.jito : (env.USE_JITO === "true"),
     jitoRegion: cliOpts.jitoRegion || env.JITO_REGION || "default",
     jitoTipLamports: Number(cliOpts.jitoTip || env.JITO_TIP_LAMPORTS || "10000"),
+    jupiterApiKey: env.JUPITER_API_KEY || undefined,
   };
 }

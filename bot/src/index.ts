@@ -58,7 +58,7 @@ async function main(): Promise<void> {
   logger.info({ rpc: config.rpcUrl.replace(/api-key=.*/, "api-key=***"), slot }, "Connected to RPC");
 
   // Initialize providers
-  const jupiterClient = new JupiterClient(logger);
+  const jupiterClient = new JupiterClient(logger, true, config.jupiterApiKey);
 
   const flashLoanClient = new FlashLoanClient(
     connection,

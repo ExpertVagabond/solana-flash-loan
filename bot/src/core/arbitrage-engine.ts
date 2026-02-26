@@ -7,6 +7,9 @@ import {
   getAssociatedTokenAddress,
   createAssociatedTokenAccountInstruction,
   getAccount,
+  TOKEN_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
+  ASSOCIATED_TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
 import type pino from "pino";
 import { BotConfig } from "../config";
@@ -103,9 +106,9 @@ export class ArbitrageEngine {
           if (!this.running) break;
           const pair = this.config.pairs[i];
 
-          // Stagger pairs by 2s to spread API load
+          // Stagger pairs by 300ms — Raydium handles this volume fine
           if (i > 0) {
-            await new Promise((r) => setTimeout(r, 2000));
+            await new Promise((r) => setTimeout(r, 300));
           }
 
           const [targetToken, quoteToken] = parsePair(pair);
@@ -282,8 +285,20 @@ export class ArbitrageEngine {
     }
 
     if (!this.config.dryRun) {
+      let ataFails = 0;
       for (const mint of mints) {
-        await this.ensureAta(mint);
+        try {
+          await this.ensureAta(mint);
+        } catch (err) {
+          ataFails++;
+          this.logger.warn(
+            { mint: mint.slice(0, 8), error: (err as Error).message },
+            "ATA setup failed — pairs using this mint will be skipped"
+          );
+        }
+      }
+      if (ataFails > 0) {
+        this.logger.warn({ failed: ataFails, total: mints.size }, "Some ATAs could not be created");
       }
     } else {
       this.logger.debug("Skipping ATA creation in dry-run mode");
@@ -292,29 +307,65 @@ export class ArbitrageEngine {
     this.logger.info("Pre-flight checks PASSED");
   }
 
+  /**
+   * Detect whether a mint uses Token-2022 or standard SPL Token program.
+   */
+  private async getTokenProgramForMint(mintPk: PublicKey): Promise<PublicKey> {
+    const info = await this.connection.getAccountInfo(mintPk);
+    if (!info) throw new Error(`Mint account not found: ${mintPk.toBase58()}`);
+    if (info.owner.equals(TOKEN_2022_PROGRAM_ID)) return TOKEN_2022_PROGRAM_ID;
+    return TOKEN_PROGRAM_ID;
+  }
+
   private async ensureAta(mint: string): Promise<PublicKey> {
     if (this.ataCache.has(mint)) return this.ataCache.get(mint)!;
 
     const mintPk = new PublicKey(mint);
-    const ata = await getAssociatedTokenAddress(mintPk, this.wallet.publicKey);
+
+    // Detect Token-2022 vs standard SPL Token
+    let tokenProgram: PublicKey;
+    try {
+      tokenProgram = await this.getTokenProgramForMint(mintPk);
+    } catch (err) {
+      this.logger.warn(
+        { mint: mint.slice(0, 8), error: (err as Error).message },
+        "Cannot resolve token program for mint — skipping"
+      );
+      throw err;
+    }
+
+    const isToken2022 = tokenProgram.equals(TOKEN_2022_PROGRAM_ID);
+    if (isToken2022) {
+      this.logger.debug({ mint: mint.slice(0, 8) }, "Token-2022 mint detected");
+    }
+
+    const ata = await getAssociatedTokenAddress(
+      mintPk,
+      this.wallet.publicKey,
+      false, // allowOwnerOffCurve
+      tokenProgram,
+      ASSOCIATED_TOKEN_PROGRAM_ID
+    );
 
     try {
-      await getAccount(this.connection, ata);
+      await getAccount(this.connection, ata, undefined, tokenProgram);
       this.logger.debug(
-        { mint: mint.slice(0, 8), ata: ata.toBase58() },
+        { mint: mint.slice(0, 8), ata: ata.toBase58(), token2022: isToken2022 },
         "ATA exists"
       );
     } catch {
       // ATA doesn't exist — create it
       this.logger.info(
-        { mint: mint.slice(0, 8), ata: ata.toBase58() },
+        { mint: mint.slice(0, 8), ata: ata.toBase58(), token2022: isToken2022 },
         "Creating ATA"
       );
       const ix = createAssociatedTokenAccountInstruction(
         this.wallet.publicKey,
         ata,
         this.wallet.publicKey,
-        mintPk
+        mintPk,
+        tokenProgram,
+        ASSOCIATED_TOKEN_PROGRAM_ID
       );
       const { blockhash } = await this.connection.getLatestBlockhash();
       const { Transaction } = await import("@solana/web3.js");
@@ -323,7 +374,7 @@ export class ArbitrageEngine {
       tx.feePayer = this.wallet.publicKey;
       tx.sign(this.wallet);
       await this.connection.sendRawTransaction(tx.serialize());
-      this.logger.info({ mint: mint.slice(0, 8) }, "ATA created");
+      this.logger.info({ mint: mint.slice(0, 8), token2022: isToken2022 }, "ATA created");
     }
 
     this.ataCache.set(mint, ata);
