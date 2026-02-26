@@ -125,6 +125,20 @@ async function main(): Promise<void> {
   await engine.start();
 }
 
+// Prevent unhandled WS errors from crashing the process
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled rejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  // WebSocket 429 errors from @solana/web3.js should not crash the bot
+  if (err.message?.includes("429") || err.message?.includes("ws error")) {
+    console.error("WebSocket error (non-fatal):", err.message);
+    return;
+  }
+  console.error("Fatal uncaught exception:", err);
+  process.exit(1);
+});
+
 main().catch((err) => {
   console.error("Fatal error:", err);
   process.exit(1);
