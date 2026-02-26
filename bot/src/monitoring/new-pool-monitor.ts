@@ -11,7 +11,8 @@ const DEX_PROGRAMS = {
   orca:        new PublicKey("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"),
   meteora:     new PublicKey("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"),
   meteoraAmm:  new PublicKey("Eo7WjKq67rjJQSZxS6z3YkapzY3eBj6xfkMa2AERjo2G"),
-  pumpfun:     new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"),
+  // Pump.fun bonding curve excluded — tokens are pre-graduation, not on DEXes yet.
+  // PumpSwap AMM is where graduated tokens get their first real pool.
   pumpswap:    new PublicKey("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"),
 } as const;
 
@@ -105,6 +106,8 @@ export class NewPoolMonitor {
   private seenPools: Set<string> = new Set(); // dedup
   private seenDexScreenerPairs: Set<string> = new Set();
   private running = false;
+  private txParseCount = 0;
+  private txParseWindowStart = Date.now();
 
   // Track discovered pools
   public discoveredPools: NewPoolEvent[] = [];
@@ -201,8 +204,15 @@ export class NewPoolMonitor {
     // Most pool init logs include the token mints as base58 pubkeys
     const mints = this.extractMintsFromLogs(logs.logs);
 
-    // Always fetch + parse the full transaction for reliable mint extraction.
-    // Log-based extraction is too noisy (picks up program IDs, system accounts).
+    // Rate limit tx parsing: max 5 per 10 seconds to avoid burning RPC budget
+    const now = Date.now();
+    if (now - this.txParseWindowStart > 10_000) {
+      this.txParseCount = 0;
+      this.txParseWindowStart = now;
+    }
+    if (this.txParseCount >= 5) return;
+    this.txParseCount++;
+
     this.fetchAndParseTransaction(dexName, logs.signature).catch((err) => {
       this.logger.debug(
         { sig: logs.signature.slice(0, 16), error: (err as Error).message },
