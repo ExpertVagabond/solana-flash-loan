@@ -102,23 +102,30 @@ export class ArbitrageEngine {
     const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
     const SOL = "So11111111111111111111111111111111111111112";
     const USDT = "Es9vMFrzaCERmKkowAvqYk93CfNe7VYQEHnRSLTiZSo1";
+    const KNOWN_QUOTES = new Set([USDC, SOL, USDT]);
 
-    // Only add pairs where one side is a known quote token
-    let pairKey: string | null = null;
-    if (event.tokenA === USDC || event.tokenB === USDC) {
-      const other = event.tokenA === USDC ? event.tokenB : event.tokenA;
-      pairKey = `${other.slice(0, 8)}/USDC`;
-    } else if (event.tokenA === SOL || event.tokenB === SOL) {
-      // Can't borrow SOL, but note it for triangular scanning
-      this.logger.debug(
-        { dex: event.dex, tokenA: event.tokenA.slice(0, 8), tokenB: event.tokenB.slice(0, 8) },
-        "New SOL pair — available for triangular routes"
-      );
+    // Find the unknown token — must have exactly one known quote + one unknown
+    const aIsQuote = KNOWN_QUOTES.has(event.tokenA);
+    const bIsQuote = KNOWN_QUOTES.has(event.tokenB);
+
+    // Both known (e.g. USDC/SOL pool) — skip, already in static pairs
+    if (aIsQuote && bIsQuote) return;
+    // Neither is a known quote — skip, can't borrow for direct arb
+    if (!aIsQuote && !bIsQuote) return;
+
+    const unknownMint = aIsQuote ? event.tokenB : event.tokenA;
+    const quoteMint = aIsQuote ? event.tokenA : event.tokenB;
+
+    // We can only borrow USDC, so only add USDC-paired dynamic pairs
+    if (quoteMint !== USDC) {
+      // SOL or USDT paired — available for triangular routes but not direct
       return;
     }
 
-    if (pairKey && !this.dynamicPairs.has(pairKey) && !this.config.pairs.includes(pairKey)) {
+    const pairKey = `${unknownMint.slice(0, 8)}/USDC`;
+    if (!this.dynamicPairs.has(pairKey) && !this.config.pairs.includes(pairKey)) {
       this.dynamicPairs.add(pairKey);
+      this.metrics.newPoolsDetected++;
       this.logger.info(
         { pair: pairKey, dex: event.dex, dynamicPairs: this.dynamicPairs.size },
         "DYNAMIC PAIR ADDED to scanner"
