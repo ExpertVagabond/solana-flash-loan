@@ -118,6 +118,17 @@ class CrossDexScanner:
             # Spread in basis points
             spread_bps = int((dearest_price - cheapest_price) / cheapest_price * 10000)
 
+            # Sanity check: extreme spreads are pricing bugs, not real opportunities
+            # Real cross-DEX arb > 500 bps (5%) would be arbed instantly by pros
+            if spread_bps > 500:
+                logger.debug(
+                    f"{pair}: cross-dex spread {spread_bps} bps too extreme, "
+                    f"likely pricing/decimal bug "
+                    f"({cheapest_pool.dex}@{cheapest_price:.6f} vs "
+                    f"{dearest_pool.dex}@{dearest_price:.6f})"
+                )
+                return None
+
             # Track best spread
             prev = self.best_spreads.get(pair)
             if prev is None or spread_bps > prev[0]:
@@ -170,9 +181,11 @@ class CrossDexScanner:
     ) -> Optional[float]:
         """Normalize pool price to USDC_per_target.
 
-        Raydium CLMM stores decimals in the pool account and returns adjusted price.
-        Orca Whirlpool returns raw sqrt_price without decimal adjustment.
-        Meteora DLMM returns (1 + bin_step/10000)^active_id (raw, needs decimal adj).
+        Different DEXes store prices differently:
+          Raydium CLMM: decimal-adjusted (decimals stored in pool account)
+          Orca Whirlpool: raw sqrt_price, needs 10^(dec_a - dec_b) correction
+          Meteora DLMM: raw bin price, needs 10^(dec_a - dec_b) correction
+          Raydium v4: price=0 (needs vault balance fetch, skipped)
 
         We normalize everything to: USDC per target token.
         """
@@ -184,14 +197,24 @@ class CrossDexScanner:
                 (mint_a == quote_mint and mint_b == target_mint)):
             return None
 
-        # For Orca Whirlpool: price is raw (no decimal adjustment)
-        # Apply decimal correction: price_adj = price_raw * 10^(dec_a - dec_b)
+        # Skip Raydium v4 (price requires vault balance fetch)
+        if state.dex == "raydium_v4":
+            return None
+
+        # Get decimal-adjusted price depending on DEX type
         if state.dex == "orca" and state.sqrt_price_x64 > 0:
+            # Orca Whirlpool: raw sqrt_price without decimal adjustment
             dec_a = decimals_for_mint(mint_a)
             dec_b = decimals_for_mint(mint_b)
             raw = (state.sqrt_price_x64 / (1 << 64)) ** 2
             price = raw * (10 ** (dec_a - dec_b))
+        elif state.dex == "meteora":
+            # Meteora DLMM: raw bin price without decimal adjustment
+            dec_a = decimals_for_mint(mint_a)
+            dec_b = decimals_for_mint(mint_b)
+            price = state.price * (10 ** (dec_a - dec_b))
         else:
+            # Raydium CLMM: already decimal-adjusted from pool account
             price = state.price
 
         if price <= 0:
@@ -200,9 +223,7 @@ class CrossDexScanner:
         # price = token_b per token_a (how much B you get per 1 A)
         # We want USDC_per_target
         if mint_a == target_mint and mint_b == quote_mint:
-            # price = quote_per_target = USDC_per_target (what we want)
             return price
         elif mint_a == quote_mint and mint_b == target_mint:
-            # price = target_per_quote → invert to get USDC_per_target
             return 1.0 / price if price > 0 else None
         return None

@@ -15,6 +15,7 @@ import signal
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 from loguru import logger
 from solders.pubkey import Pubkey
@@ -242,46 +243,39 @@ class ArbitrageEngine:
         """Process WebSocket-triggered arb checks.
 
         When the streamer detects a significant price move on any pool,
-        it queues the pool info here. We immediately compare against all
-        other pools for that pair to detect cross-DEX opportunities.
+        we immediately run a proper cross-DEX scan for that pair using
+        the full normalization pipeline. This avoids the raw-price
+        comparison bugs while still reacting within 200-500ms.
         """
+        recent_scans: dict[str, float] = {}  # pair -> last_scan_time
+
         while self.running:
             try:
                 pool_info, state = await asyncio.wait_for(
                     self._ws_arb_queue.get(), timeout=5.0
                 )
 
-                # Find the pair for this pool
-                pair_pools = None
-                for pp in self.pool_registry._pairs.values():
-                    for p in pp.pools:
-                        if p.address == pool_info.address:
-                            pair_pools = pp
-                            break
-                    if pair_pools:
-                        break
-
-                if not pair_pools or len(pair_pools.pools) < 2:
+                # Find which pair this pool belongs to
+                pair_name = self._find_pair_for_pool(pool_info)
+                if not pair_name:
                     continue
 
-                # Fast cross-DEX check: compare WS-updated price against cached prices
-                updated_price = self._pool_prices.get(pool_info.address, 0)
-                if updated_price <= 0:
+                # Deduplicate: don't scan same pair more than once per 2 seconds
+                now = time.time()
+                if pair_name in recent_scans and now - recent_scans[pair_name] < 2.0:
                     continue
+                recent_scans[pair_name] = now
 
-                for other_pool in pair_pools.pools:
-                    if other_pool.address == pool_info.address:
-                        continue
-                    other_price = self._pool_prices.get(other_pool.address, 0)
-                    if other_price <= 0:
-                        continue
-
-                    spread = abs(updated_price - other_price) / min(updated_price, other_price) * 10000
-                    if spread >= 15:  # 15+ bps spread = potential opportunity
+                # Run proper cross-DEX scan with full normalization
+                if self.cross_dex_scanner:
+                    opp = await self.cross_dex_scanner.scan_pair(
+                        pair_name, self.config.borrow_amount
+                    )
+                    if opp:
                         logger.info(
-                            f"WS-ARB: {pool_info.label} vs {other_pool.label}: "
-                            f"{spread:.1f} bps spread! "
-                            f"{updated_price:.4f} vs {other_price:.4f}"
+                            f"WS-ARB HIT {pair_name}: {opp.spread_bps:+d} bps spread, "
+                            f"buy@{opp.buy_pool.dex}@{opp.buy_price:.4f} "
+                            f"sell@{opp.sell_pool.dex}@{opp.sell_price:.4f}"
                         )
                         self.metrics.cross_dex_opps += 1
 
@@ -330,6 +324,41 @@ class ArbitrageEngine:
             f"across {self.pool_registry.total_pairs} pairs"
         )
 
+    def _normalize_ws_price(self, state) -> float:
+        """Normalize pool state price for WebSocket comparison.
+
+        Same logic as cross_dex_scanner._normalize_price() but without
+        the pair-specific inversion — just applies decimal correction.
+        """
+        from tokens import decimals_for_mint
+
+        if state.dex == "orca" and state.sqrt_price_x64 > 0:
+            dec_a = decimals_for_mint(state.token_mint_a)
+            dec_b = decimals_for_mint(state.token_mint_b)
+            return (state.sqrt_price_x64 / (1 << 64)) ** 2 * (10 ** (dec_a - dec_b))
+        elif state.dex == "meteora":
+            dec_a = decimals_for_mint(state.token_mint_a)
+            dec_b = decimals_for_mint(state.token_mint_b)
+            return state.price * (10 ** (dec_a - dec_b))
+        elif state.dex == "raydium_v4":
+            return 0.0  # Can't determine from pool account alone
+        return state.price
+
+    def _find_pair_for_pool(self, pool_info) -> Optional[str]:
+        """Find the human-readable pair name (e.g. 'SOL/USDC') for a pool."""
+        from tokens import WELL_KNOWN_MINTS
+
+        mint_to_sym = {v: k for k, v in WELL_KNOWN_MINTS.items()}
+        sym_a = mint_to_sym.get(pool_info.token_a)
+        sym_b = mint_to_sym.get(pool_info.token_b)
+        if not sym_a or not sym_b:
+            return None
+
+        for pair in self.config.pairs:
+            if pair == f"{sym_a}/{sym_b}" or pair == f"{sym_b}/{sym_a}":
+                return pair
+        return None
+
     def _on_pool_update(self, state, pool_info):
         """Callback from WebSocket streamer when a pool account changes.
 
@@ -340,20 +369,28 @@ class ArbitrageEngine:
         if state.price <= 0:
             return
 
+        # Normalize price (apply decimal correction for Orca/Meteora)
+        price = self._normalize_ws_price(state)
+        if price <= 0:
+            return
+
         old_price = self._pool_prices.get(state.pool_address)
-        self._pool_prices[state.pool_address] = state.price
+        self._pool_prices[state.pool_address] = price
 
         # Log significant price moves (> 5 bps change)
         if old_price and old_price > 0:
-            change_bps = abs(state.price - old_price) / old_price * 10000
+            change_bps = abs(price - old_price) / old_price * 10000
             if change_bps >= 5:
                 logger.info(
                     f"WS: {pool_info.label} price moved {change_bps:.1f} bps "
-                    f"({old_price:.4f} -> {state.price:.4f})"
+                    f"({old_price:.4f} -> {price:.4f})"
                 )
-                # Queue immediate cross-DEX check for this pair
+                # Queue pair for immediate cross-DEX scan
                 if self._ws_arb_queue is not None:
-                    self._ws_arb_queue.put_nowait((pool_info, state))
+                    try:
+                        self._ws_arb_queue.put_nowait((pool_info, state))
+                    except asyncio.QueueFull:
+                        pass  # Drop if queue is full
 
     async def _test_raydium(self):
         """Quick connectivity test for Raydium via curl_cffi."""
