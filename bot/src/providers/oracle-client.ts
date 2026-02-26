@@ -19,6 +19,21 @@ const PYTH_PRICE_FEEDS: Record<string, string> = {
   // WIF/USD
   EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm:
     "6ABgrEZk8urs6kJ1JNdC1sspH5zKXRqxy8sg3ZG2cQps",
+  // RAY/USD
+  "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R":
+    "AnLf8tVYCM816gmBjiy8n53eXKKEDydT5piYjjQDPXRc",
+  // RENDER/USD
+  rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof:
+    "HAm5DZhrgrWa12heKSbodJCbxpGGMSLqMjV2FnPGKbCG",
+  // PYTH/USD
+  HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3:
+    "nrYkQQQur7z8rYTST3G9GqATviK5SZTKyHKsCKuNQJN",
+  // HNT/USD
+  hntyVP6YFm1Hg25TN9WGLqM12b8TQmcknKrdu1oxWux:
+    "7moA1i5vQUpfDwSpK6Pw9s56ahB7WFGidtbL2ujWrVvm",
+  // ORCA/USD
+  orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE:
+    "4ivThkX8uRxBpHsdWSqyXYihzKF3zpRGAUCqyusSRWqK",
 };
 
 /**

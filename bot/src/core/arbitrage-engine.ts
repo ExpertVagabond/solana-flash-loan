@@ -141,10 +141,15 @@ export class ArbitrageEngine {
           }
         }
 
-        // Phase 2: Cross-DEX arb scan (buy cheap DEX, sell expensive DEX)
-        for (let i = 0; i < this.config.pairs.length; i++) {
-          if (!this.running) break;
-          const pair = this.config.pairs[i];
+        // Phase 2: Cross-DEX arb scan — only on top 5 tightest-spread pairs
+        // (saves rate budget by not scanning all 37+ pairs across 4 DEXes)
+        const bestPairs = this.scanner.getBestSpreads();
+        const sortedPairs = [...bestPairs.entries()]
+          .sort((a, b) => b[1].bps - a[1].bps)
+          .slice(0, 5)
+          .map(([pair]) => pair);
+
+        for (const pair of sortedPairs) {
           const [targetToken, quoteToken] = parsePair(pair);
 
           try {

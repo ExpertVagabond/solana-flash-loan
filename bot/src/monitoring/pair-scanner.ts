@@ -12,14 +12,53 @@ import {
  * Value = borrow amount in token smallest units (0 = use default).
  */
 const PAIR_BORROW_OVERRIDES: Record<string, bigint> = {
-  // SOL: deep liquidity, use full borrow
-  So111111: 0n,
-  // BONK: thin USDC liquidity — 20 USDC to keep price impact < 0.1%
-  DezXAZ8z: 20_000_000n,
-  // JUP: moderate — 50 USDC
-  JUPyiwrY: 50_000_000n,
-  // WIF: moderate — 50 USDC
-  EKpQGSJt: 50_000_000n,
+  // === Deep liquidity — full borrow ($200) ===
+  So111111: 0n,  // SOL
+  Es9vMFrz: 0n,  // USDT
+
+  // === High liquidity — $100 ===
+  JUPyiwrY: 100_000_000n,  // JUP
+  "4k3Dyjzv": 100_000_000n, // RAY
+  orcaEKTd: 100_000_000n,  // ORCA
+  mSoLzYCx: 100_000_000n,  // mSOL
+  J1toso1u: 100_000_000n,  // jitoSOL
+  jtojtome: 100_000_000n,  // JTO
+  rndrizKT: 100_000_000n,  // RENDER
+  "85VBFQZC": 100_000_000n, // W
+
+  // === Moderate liquidity — $50 ===
+  EKpQGSJt: 50_000_000n,   // WIF
+  HZ1JovNi: 50_000_000n,   // PYTH
+  hntyVP6Y: 50_000_000n,   // HNT
+  TNSRxcUx: 50_000_000n,   // TNSR
+  bSo13r4T: 50_000_000n,   // bSOL
+  "5oVNBeEE": 50_000_000n,  // INF
+  KMNo3nJs: 50_000_000n,   // KMNO
+  DriFtupJ: 50_000_000n,   // DRIFT
+
+  // === Meme / volatile — $20 (wider spreads, more opportunity) ===
+  DezXAZ8z: 20_000_000n,   // BONK
+  "7GCihgDB": 20_000_000n,  // POPCAT
+  MEW1gQWJ: 20_000_000n,   // MEW
+  "6p6xgHyF": 20_000_000n,  // TRUMP
+  "9BB6NFEc": 20_000_000n,  // FARTCOIN
+  ukHH6c7m: 20_000_000n,   // BOME
+  "7BgBvyjr": 20_000_000n,  // SLERF
+  WENWENvq: 20_000_000n,   // WEN
+
+  // === Low liquidity — $10 (most arb potential, thin books) ===
+  "7xKXtg2C": 10_000_000n,  // SAMO
+  MNDEFzGv: 10_000_000n,   // MNDE
+  StepAscQ: 10_000_000n,   // STEP
+  SHDWyBxi: 10_000_000n,   // SHDW
+  DUSTawuc: 10_000_000n,   // DUST
+  "4vMsoUT2": 10_000_000n,  // HONEY
+  BLZEEuZU: 10_000_000n,   // BLZE
+  ZEUS1aR7: 10_000_000n,   // ZEUS
+  PARCLdS3: 10_000_000n,   // PARCL
+  "7EYnhQoR": 10_000_000n,  // SILLY
+  HeLp6NuQ: 10_000_000n,   // AI16Z
+  "2nnGAqbW": 10_000_000n,  // GRIFFAIN
 };
 
 export class PairScanner {
