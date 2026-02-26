@@ -40,7 +40,7 @@ class QuoteProvider:
         self.jupiter_api_key = jupiter_api_key
         self.use_raydium = use_raydium
         self._raydium_cooldown_until = 0.0
-        self._raydium_cooldown_sec = 60.0
+        self._raydium_cooldown_sec = 300.0  # 5 min — Cloudflare rate limit window is longer than 60s
         self._raydium_last_request = 0.0
         self._raydium_min_interval = 1.2  # seconds between Raydium requests
         self._cf_session: Optional[AsyncSession] = None

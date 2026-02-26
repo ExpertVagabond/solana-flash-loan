@@ -123,12 +123,26 @@ class ArbitrageEngine:
             logger.info(f"METRICS: {self.metrics.summary()}")
 
     async def _scan_loop(self):
+        # Priority pairs: scan these more frequently (tightest historical spreads)
+        priority_pairs = {"SOL/USDC", "MSOL/USDC", "JITOSOL/USDC", "BSOL/USDC",
+                         "JUP/USDC", "TRUMP/USDC", "ORCA/USDC", "INF/USDC"}
+        cycle_count = 0
+
         while self.running:
             cycle_start = time.monotonic()
             self.metrics.scan_cycles += 1
+            cycle_count += 1
+
+            # Every 3rd cycle: scan all pairs. Otherwise: priority pairs only.
+            if cycle_count % 3 == 0:
+                pairs_to_scan = self.config.pairs
+                logger.debug(f"Full scan cycle ({len(pairs_to_scan)} pairs)")
+            else:
+                pairs_to_scan = [p for p in self.config.pairs if p in priority_pairs]
+                logger.debug(f"Priority scan cycle ({len(pairs_to_scan)} pairs)")
 
             try:
-                for i, pair in enumerate(self.config.pairs):
+                for i, pair in enumerate(pairs_to_scan):
                     if not self.running:
                         break
 
@@ -163,9 +177,12 @@ class ArbitrageEngine:
                     self.stop()
                     break
 
-            # Throttle
+            # Throttle — shorter wait for priority-only cycles
             elapsed = time.monotonic() - cycle_start
-            sleep_s = max(0, self.config.poll_interval_ms / 1000 - elapsed)
+            target_s = self.config.poll_interval_ms / 1000
+            if cycle_count % 3 != 0:
+                target_s = min(target_s, 5.0)  # Priority cycles: 5s max gap
+            sleep_s = max(0, target_s - elapsed)
             if sleep_s > 0 and self.running:
                 await asyncio.sleep(sleep_s)
 
