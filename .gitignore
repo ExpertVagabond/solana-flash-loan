@@ -5,3 +5,6 @@ target
 node_modules
 test-ledger
 .yarn
+bot/.env
+bot/dist
+bot/node_modules
