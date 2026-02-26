@@ -365,20 +365,39 @@ export class JupiterClient {
             { attempt, delayMs: delay },
             "Rate limited, backing off"
           );
+          clearTimeout(timeout);
           await new Promise((r) => setTimeout(r, delay));
           continue;
         }
 
         if (!res.ok) {
           const text = await res.text();
-          throw new Error(`API ${res.status}: ${text}`);
+          clearTimeout(timeout);
+          // 4xx errors (except 429) are not retriable — fail immediately
+          if (res.status >= 400 && res.status < 500) {
+            throw new Error(`API ${res.status}: ${text}`);
+          }
+          // 5xx errors are retriable
+          lastError = new Error(`API ${res.status}: ${text}`);
+          if (attempt < this.maxRetries) {
+            const delay = this.retryDelayMs * 2 ** attempt;
+            this.logger.warn({ attempt, delayMs: delay }, "Server error, retrying");
+            await new Promise((r) => setTimeout(r, delay));
+          }
+          continue;
         }
 
+        clearTimeout(timeout);
         return await res.json();
       } catch (err) {
+        clearTimeout(timeout);
         lastError = err as Error;
         if (lastError.name === "AbortError") {
           lastError = new Error(`Request timed out after ${timeoutMs}ms`);
+        }
+        // 4xx errors thrown above should propagate immediately
+        if (lastError.message.startsWith("API 4")) {
+          throw lastError;
         }
         if (attempt < this.maxRetries) {
           const delay = this.retryDelayMs * 2 ** attempt;
@@ -388,8 +407,6 @@ export class JupiterClient {
           );
           await new Promise((r) => setTimeout(r, delay));
         }
-      } finally {
-        clearTimeout(timeout);
       }
     }
 

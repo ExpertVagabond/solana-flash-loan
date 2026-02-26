@@ -5,12 +5,14 @@ import { WELL_KNOWN_MINTS } from "../utils/tokens";
 
 // --- DEX Program IDs ---
 const DEX_PROGRAMS = {
-  raydiumV4:  new PublicKey("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"),
+  raydiumV4:   new PublicKey("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"),
   raydiumClmm: new PublicKey("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"),
   raydiumCpmm: new PublicKey("CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C"),
-  orca:       new PublicKey("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"),
-  meteora:    new PublicKey("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"),
-  meteoraAmm: new PublicKey("Eo7WjKq67rjJQSZxS6z3YkapzY3eBj6xfkMa2AERjo2G"),
+  orca:        new PublicKey("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"),
+  meteora:     new PublicKey("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"),
+  meteoraAmm:  new PublicKey("Eo7WjKq67rjJQSZxS6z3YkapzY3eBj6xfkMa2AERjo2G"),
+  pumpfun:     new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"),
+  pumpswap:    new PublicKey("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"),
 } as const;
 
 // Log patterns that indicate pool/position creation (not regular swaps)
@@ -25,6 +27,8 @@ const POOL_INIT_PATTERNS = [
   "CreatePool",           // Raydium CLMM
   "create_amm_config",    // Raydium AMM config
   "Instruction: InitializePool", // Full Orca log prefix
+  "Program log: Create",  // Pump.fun bonding curve creation
+  "create_pool",          // PumpSwap AMM pool creation
 ];
 
 // Well-known program addresses to exclude from mint extraction
@@ -45,6 +49,9 @@ const EXCLUDED_ADDRESSES = new Set([
   "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",     // Orca
   "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",     // Meteora DLMM
   "Eo7WjKq67rjJQSZxS6z3YkapzY3eBj6xfkMa2AERjo2G",    // Meteora AMM
+  // Pump.fun / PumpSwap
+  "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",     // Pump.fun Bonding Curve
+  "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",     // PumpSwap AMM
   // Other common programs
   "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",     // Jupiter v6
   "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr",     // Memo
@@ -324,13 +331,21 @@ export class NewPoolMonitor {
         (p: any) => p.chainId === "solana" && p.tokenAddress
       );
 
+      // Probe up to 3 new tokens per cycle to stay within rate budget
+      let probed = 0;
       for (const token of solanaTokens) {
+        if (probed >= 3) break;
         const mint = token.tokenAddress;
         if (this.seenDexScreenerPairs.has(mint)) continue;
         this.seenDexScreenerPairs.add(mint);
+        probed++;
 
-        // Check if this token has liquidity by trying a Jupiter quote
-        this.probeNewToken(mint, token.description || token.tokenAddress).catch(() => {});
+        // Check if this token has liquidity by trying a Jupiter quote (sequential to avoid rate spam)
+        try {
+          await this.probeNewToken(mint, token.description || token.tokenAddress);
+        } catch {
+          // Not quotable — skip
+        }
       }
     } finally {
       clearTimeout(timeout);
