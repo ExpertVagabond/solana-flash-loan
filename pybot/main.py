@@ -130,6 +130,7 @@ class ArbitrageEngine:
         self.pool_streamer: PoolStreamer | None = None
         # Track latest pool prices from WebSocket for fast arb detection
         self._pool_prices: dict[str, float] = {}  # pool_address -> price
+        self._ws_arb_queue: asyncio.Queue | None = None  # Queue for WS-triggered arb checks
 
     async def start(self):
         self.running = True
@@ -204,19 +205,27 @@ class ArbitrageEngine:
 
         # Start WebSocket streamer in background (if WS URL provided)
         streamer_task = None
+        ws_arb_task = None
         if self.config.ws_url:
+            self._ws_arb_queue = asyncio.Queue(maxsize=100)
             self.pool_streamer = PoolStreamer(
                 ws_url=self.config.ws_url,
                 registry=self.pool_registry,
                 on_pool_update=self._on_pool_update,
             )
             streamer_task = asyncio.create_task(self.pool_streamer.start())
-            logger.info("WebSocket pool streamer started")
+            ws_arb_task = asyncio.create_task(self._ws_arb_loop())
+            logger.info(
+                f"WebSocket pool streamer started: "
+                f"tracking {self.pool_registry.total_pools} pools"
+            )
 
         try:
             await self._scan_loop()
         finally:
             metrics_task.cancel()
+            if ws_arb_task:
+                ws_arb_task.cancel()
             if streamer_task:
                 if self.pool_streamer:
                     await self.pool_streamer.stop()
@@ -228,6 +237,58 @@ class ArbitrageEngine:
                 await self.rpc.close()
             logger.info(f"FINAL METRICS: {self.metrics.summary()}")
             logger.info("Bot stopped.")
+
+    async def _ws_arb_loop(self):
+        """Process WebSocket-triggered arb checks.
+
+        When the streamer detects a significant price move on any pool,
+        it queues the pool info here. We immediately compare against all
+        other pools for that pair to detect cross-DEX opportunities.
+        """
+        while self.running:
+            try:
+                pool_info, state = await asyncio.wait_for(
+                    self._ws_arb_queue.get(), timeout=5.0
+                )
+
+                # Find the pair for this pool
+                pair_pools = None
+                for pp in self.pool_registry._pairs.values():
+                    for p in pp.pools:
+                        if p.address == pool_info.address:
+                            pair_pools = pp
+                            break
+                    if pair_pools:
+                        break
+
+                if not pair_pools or len(pair_pools.pools) < 2:
+                    continue
+
+                # Fast cross-DEX check: compare WS-updated price against cached prices
+                updated_price = self._pool_prices.get(pool_info.address, 0)
+                if updated_price <= 0:
+                    continue
+
+                for other_pool in pair_pools.pools:
+                    if other_pool.address == pool_info.address:
+                        continue
+                    other_price = self._pool_prices.get(other_pool.address, 0)
+                    if other_price <= 0:
+                        continue
+
+                    spread = abs(updated_price - other_price) / min(updated_price, other_price) * 10000
+                    if spread >= 15:  # 15+ bps spread = potential opportunity
+                        logger.info(
+                            f"WS-ARB: {pool_info.label} vs {other_pool.label}: "
+                            f"{spread:.1f} bps spread! "
+                            f"{updated_price:.4f} vs {other_price:.4f}"
+                        )
+                        self.metrics.cross_dex_opps += 1
+
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                logger.debug(f"WS arb loop error: {e}")
 
     async def _discover_pools(self):
         """Discover AMM pools for all trading pairs via DEX APIs + Jupiter routing."""
@@ -250,10 +311,13 @@ class ArbitrageEngine:
             except Exception as e:
                 logger.debug(f"DEX API discovery failed for {pair}: {e}")
 
-        # Phase 2: Jupiter routing for all pairs (catches aggregator routes)
+        # Phase 2: Jupiter routing only for pairs without DEX API pools
         for pair in self.config.pairs:
             try:
                 target_mint, quote_mint = parse_pair(pair)
+                existing = self.pool_registry.get_pair_pools(quote_mint, target_mint)
+                if existing and len(existing.pools) >= 2:
+                    continue  # Already have enough pools from DEX APIs
                 await self.pool_registry.discover_pools_for_pair(
                     quote_mint, target_mint, pair
                 )
@@ -267,10 +331,29 @@ class ArbitrageEngine:
         )
 
     def _on_pool_update(self, state, pool_info):
-        """Callback from WebSocket streamer when a pool account changes."""
+        """Callback from WebSocket streamer when a pool account changes.
+
+        Fires on every on-chain pool state change — this is where we catch
+        price dislocations in real-time, within the same slot.
+        """
         self.metrics.ws_updates += 1
-        if state.price > 0:
-            self._pool_prices[state.pool_address] = state.price
+        if state.price <= 0:
+            return
+
+        old_price = self._pool_prices.get(state.pool_address)
+        self._pool_prices[state.pool_address] = state.price
+
+        # Log significant price moves (> 5 bps change)
+        if old_price and old_price > 0:
+            change_bps = abs(state.price - old_price) / old_price * 10000
+            if change_bps >= 5:
+                logger.info(
+                    f"WS: {pool_info.label} price moved {change_bps:.1f} bps "
+                    f"({old_price:.4f} -> {state.price:.4f})"
+                )
+                # Queue immediate cross-DEX check for this pair
+                if self._ws_arb_queue is not None:
+                    self._ws_arb_queue.put_nowait((pool_info, state))
 
     async def _test_raydium(self):
         """Quick connectivity test for Raydium via curl_cffi."""
