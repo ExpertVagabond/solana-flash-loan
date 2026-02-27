@@ -37,6 +37,7 @@ from pool_registry import PoolRegistry
 from cross_dex_scanner import CrossDexScanner
 from pool_streamer import PoolStreamer
 from triangular_scanner import TriangularScanner
+from alt_manager import ALTManager
 
 # ── Constants ──
 
@@ -136,6 +137,8 @@ class ArbitrageEngine:
         self.cross_dex_scanner: CrossDexScanner | None = None
         self.triangular_scanner: TriangularScanner | None = None
         self.pool_streamer: PoolStreamer | None = None
+        # ALT manager for raw swap transactions
+        self.alt_manager: ALTManager | None = None
         # Track latest pool prices from WebSocket for fast arb detection
         self._pool_prices: dict[str, float] = {}  # pool_address -> price
         self._ws_arb_queue: asyncio.Queue | None = None  # Queue for WS-triggered arb checks
@@ -214,6 +217,15 @@ class ArbitrageEngine:
             min_profit_bps=15,  # Pool graph overestimates by ~100-300 bps; 15 filters noise
         )
         self.metrics.pools_tracked = self.pool_registry.total_pools
+
+        # 9. Initialize ALT for raw swap transactions
+        if not self.config.dry_run:
+            try:
+                self.alt_manager = ALTManager(self.rpc, self.borrower)
+                await self.alt_manager.initialize()
+            except Exception as e:
+                logger.warning(f"ALT init failed (raw swaps will fall back to Jupiter): {e}")
+                self.alt_manager = None
 
         # Test quote connectivity
         await self._test_raydium()
@@ -771,6 +783,15 @@ class ArbitrageEngine:
             last_valid = None
             used_raw = False
 
+            # Collect pool accounts for ALT (ensures tx fits in 1232 bytes)
+            alt_accounts = []
+            if self.alt_manager and opp.edges:
+                alt_accounts = self._collect_alt_accounts(opp)
+                try:
+                    await self.alt_manager.ensure_accounts(alt_accounts)
+                except Exception as alt_err:
+                    logger.debug(f"ALT extend failed: {alt_err}")
+
             try:
                 tx, blockhash, last_valid = await build_raw_triangular_transaction(
                     rpc=self.rpc,
@@ -781,6 +802,7 @@ class ArbitrageEngine:
                     compute_unit_price=50000,
                     compute_unit_limit=600000,
                     jito_tip_ix=jito_tip_ix,
+                    address_lookup_table_accounts=self.alt_manager.get_tables() if self.alt_manager else None,
                 )
                 used_raw = True
                 logger.info(f"Built RAW triangular tx: {path_str}")
@@ -834,6 +856,66 @@ class ArbitrageEngine:
         except Exception as e:
             self.metrics.execution_failures += 1
             logger.error(f"Triangular execution failed: {e}")
+
+    def _collect_alt_accounts(self, opp) -> list:
+        """Collect all non-signer pubkeys from a triangular opportunity for ALT."""
+        from amm_swap import (
+            TOKEN_PROGRAM_ID, ORCA_WHIRLPOOL_PROGRAM, RAYDIUM_CLMM_PROGRAM,
+            SYSTEM_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID,
+            get_associated_token_address, derive_orca_tick_array,
+            derive_raydium_tick_array, derive_orca_oracle,
+            tick_array_start_index,
+        )
+        accounts = set()
+
+        # Static program IDs
+        accounts.add(TOKEN_PROGRAM_ID)
+        accounts.add(SYSTEM_PROGRAM_ID)
+        accounts.add(ASSOCIATED_TOKEN_PROGRAM_ID)
+
+        # Flash loan accounts
+        if self.flash_loan:
+            accounts.add(self.flash_loan.program_id)
+            accounts.add(self.flash_loan.pool_pda)
+            accounts.add(self.flash_loan.vault_pda)
+
+        # Token ATAs and pool accounts for each edge
+        for edge in opp.edges:
+            pool = edge.pool_state
+            pool_pk = Pubkey.from_string(pool.pool_address)
+            accounts.add(pool_pk)
+            accounts.add(Pubkey.from_string(pool.token_vault_a))
+            accounts.add(Pubkey.from_string(pool.token_vault_b))
+
+            # ATAs for both mints
+            for mint_str in (pool.token_mint_a, pool.token_mint_b):
+                mint_pk = Pubkey.from_string(mint_str)
+                accounts.add(get_associated_token_address(self.borrower_pk, mint_pk))
+                accounts.add(mint_pk)
+
+            # DEX-specific accounts
+            if pool.dex == "orca":
+                accounts.add(ORCA_WHIRLPOOL_PROGRAM)
+                accounts.add(derive_orca_oracle(pool_pk))
+                a_to_b = (edge.from_mint == pool.token_mint_a)
+                direction = -1 if a_to_b else 1
+                for off in (0, direction, direction * 2):
+                    start = tick_array_start_index(pool.tick, pool.tick_spacing, off)
+                    accounts.add(derive_orca_tick_array(pool_pk, start))
+
+            elif pool.dex == "raydium_clmm":
+                accounts.add(RAYDIUM_CLMM_PROGRAM)
+                if pool.amm_config:
+                    accounts.add(pool.amm_config)
+                if pool.observation_key:
+                    accounts.add(pool.observation_key)
+                a_to_b = (edge.from_mint == pool.token_mint_a)
+                direction = -1 if a_to_b else 1
+                for off in (0, direction, direction * 2):
+                    start = tick_array_start_index(pool.tick, pool.tick_spacing, off)
+                    accounts.add(derive_raydium_tick_array(pool_pk, start))
+
+        return list(accounts)
 
     async def _execute_cross_dex(self, opp):
         """Build, simulate, and send a cross-DEX arb transaction."""

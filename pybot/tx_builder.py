@@ -492,6 +492,7 @@ async def build_raw_triangular_transaction(
     compute_unit_price: int = 50000,
     compute_unit_limit: int = 600000,
     jito_tip_ix: Optional[Instruction] = None,
+    address_lookup_table_accounts: Optional[list] = None,
 ) -> tuple:
     """Build 3-leg triangular arb with raw AMM swap instructions.
 
@@ -598,7 +599,8 @@ async def build_raw_triangular_transaction(
         f"({len(ata_create_ixs)} ATAs, 3 swaps, jito={jito_tip_ix is not None})"
     )
 
-    # Build V0 transaction (no ALTs needed for raw instructions — all accounts inline)
+    # Build V0 transaction with ALTs to stay under 1232-byte limit
+    alts = address_lookup_table_accounts or []
     blockhash_resp = await rpc.get_latest_blockhash("confirmed")
     blockhash = str(blockhash_resp.value.blockhash)
     last_valid = blockhash_resp.value.last_valid_block_height
@@ -606,7 +608,7 @@ async def build_raw_triangular_transaction(
     msg = MessageV0.try_compile(
         payer=borrower_pk,
         instructions=instructions,
-        address_lookup_table_accounts=[],
+        address_lookup_table_accounts=alts,
         recent_blockhash=Hash.from_string(blockhash),
     )
 
