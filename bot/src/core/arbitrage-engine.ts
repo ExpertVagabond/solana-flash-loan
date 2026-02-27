@@ -272,12 +272,10 @@ export class ArbitrageEngine {
       "Arbitrage engine STARTED"
     );
 
-    // Borrow sizes to test per pair (USDC 6 decimals)
-    // Keep small to conserve API quota — 2 sizes covers spread detection
-    const BORROW_SIZES = [
-      50_000_000n,    // $50 — sweet spot for thin pools
-      500_000_000n,   // $500 — decent size for liquid pairs
-    ];
+    // Primary borrow size — single size for main scan to conserve API quota
+    const PRIMARY_BORROW = 100_000_000n; // $100 — balanced for most pools
+    // Secondary size — only tested when primary shows near-profitable spread
+    const SECONDARY_BORROW = 500_000_000n; // $500
 
     // Hot pairs get scanned every cycle; cold pairs rotate
     const HOT_PAIRS = new Set([
@@ -312,23 +310,22 @@ export class ArbitrageEngine {
 
           const [targetToken, quoteToken] = parsePair(pair);
 
-          // Test multiple borrow sizes — find the one with best profit
+          // Single-size scan — only test second size if first shows promise
           let bestOpp: ArbitrageOpportunity | null = null;
 
-          for (const size of BORROW_SIZES) {
-            if (!this.running) break;
-            try {
-              const opp = await this.scanner.scanPair(pair, quoteToken, targetToken, size);
-              if (opp && (!bestOpp || opp.profitBps > bestOpp.profitBps)) {
-                bestOpp = opp;
+          try {
+            const opp = await this.scanner.scanPair(pair, quoteToken, targetToken, PRIMARY_BORROW);
+            if (opp) {
+              bestOpp = opp;
+              // Near profitable? Try larger size for better absolute profit
+              if (opp.profitBps >= -5) {
+                try {
+                  const opp2 = await this.scanner.scanPair(pair, quoteToken, targetToken, SECONDARY_BORROW);
+                  if (opp2 && opp2.profitBps > opp.profitBps) bestOpp = opp2;
+                } catch { /* no route at larger size */ }
               }
-              // If we found a profitable opportunity, try the next size
-              // but don't waste API calls if this size returned -20+ bps
-              if (opp && opp.profitBps < -10) break;
-            } catch {
-              break; // No route at this size — skip larger sizes
             }
-          }
+          } catch { /* no route */ }
 
           if (bestOpp && bestOpp.profitBps >= this.config.minProfitBps) {
             this.metrics.opportunitiesFound++;

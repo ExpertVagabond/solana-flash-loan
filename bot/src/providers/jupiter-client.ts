@@ -84,18 +84,23 @@ export class JupiterClient {
   private jupiterFailCount = 0;
   // Raydium cooldown: pause after rate limit, resume after cooldown expires
   private raydiumCooldownUntil = 0;
-  private raydiumCooldownMs = 300_000; // 5min cooldown after rate limit
-  // Jupiter API key (Basic tier: 1 RPS free)
+  private raydiumCooldownMs = 120_000; // 2min cooldown after rate limit
+  // Jupiter API key (Basic tier: 600 req/min)
   private jupiterApiKey: string | null;
   // Global rate limiter shared across all Jupiter calls
-  // Jupiter Basic tier: 1 req/sec. Use 0.9/sec for safety margin.
+  // With API key: 600/min = 10/sec. Use 8/sec with burst of 10 for safety.
   public rateLimiter: RateLimiter;
+  // Quote cache — avoid duplicate API calls for same pair within TTL
+  private quoteCache: Map<string, { quote: JupiterQuote; ts: number }> = new Map();
+  private quoteCacheTtlMs = 5_000; // 5 second TTL
 
   constructor(logger: pino.Logger, useRaydiumForQuotes = true, jupiterApiKey?: string) {
     this.logger = logger;
     this.useRaydiumForQuotes = useRaydiumForQuotes;
     this.jupiterApiKey = jupiterApiKey ?? null;
-    this.rateLimiter = new RateLimiter(5, 2.0); // burst of 5, sustained 2/sec with API key
+    // Jupiter API key Basic tier: ~2 RPS sustained. Without key: ~1 RPS.
+    const rps = this.jupiterApiKey ? 2 : 0.8;
+    this.rateLimiter = new RateLimiter(3, rps);
     if (this.jupiterApiKey) {
       this.logger.info("Jupiter API key configured");
     } else {
@@ -116,10 +121,27 @@ export class JupiterClient {
     slippageBps: number,
     onlyDirectRoutes = false
   ): Promise<JupiterQuote> {
+    // Check cache first — same pair+amount within TTL reuses quote
+    const cacheKey = `${inputMint}:${outputMint}:${amount}`;
+    const cached = this.quoteCache.get(cacheKey);
+    if (cached && Date.now() - cached.ts < this.quoteCacheTtlMs) {
+      return cached.quote;
+    }
+
+    // Evict stale entries periodically
+    if (this.quoteCache.size > 200) {
+      const now = Date.now();
+      for (const [k, v] of this.quoteCache) {
+        if (now - v.ts > this.quoteCacheTtlMs) this.quoteCache.delete(k);
+      }
+    }
+
     // Try Raydium first (skip if cooling down from rate limit)
     if (this.useRaydiumForQuotes && Date.now() > this.raydiumCooldownUntil) {
       try {
-        return await this.getRaydiumQuote(inputMint, outputMint, amount, slippageBps);
+        const quote = await this.getRaydiumQuote(inputMint, outputMint, amount, slippageBps);
+        this.quoteCache.set(cacheKey, { quote, ts: Date.now() });
+        return quote;
       } catch (err) {
         const msg = (err as Error).message;
         // If rate-limited, activate cooldown
@@ -135,7 +157,9 @@ export class JupiterClient {
       }
     }
 
-    return this.getJupiterQuote(inputMint, outputMint, amount, slippageBps, onlyDirectRoutes);
+    const quote = await this.getJupiterQuote(inputMint, outputMint, amount, slippageBps, onlyDirectRoutes);
+    this.quoteCache.set(cacheKey, { quote, ts: Date.now() });
+    return quote;
   }
 
   /** Raydium quote — generous rate limit, returns data mapped to JupiterQuote shape */
@@ -361,6 +385,8 @@ export class JupiterClient {
 
         if (res.status === 429) {
           const delay = this.retryDelayMs * 2 ** attempt;
+          // Drain rate limiter tokens to force slowdown across all callers
+          this.rateLimiter.drain();
           this.logger.warn(
             { attempt, delayMs: delay },
             "Rate limited, backing off"

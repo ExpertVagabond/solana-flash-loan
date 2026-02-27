@@ -59,4 +59,10 @@ export class RateLimiter {
     this.refill();
     return Math.floor(this.tokens);
   }
+
+  /** Drain all tokens — forces subsequent callers to wait for refill. */
+  drain(): void {
+    this.tokens = 0;
+    this.lastRefill = Date.now();
+  }
 }
