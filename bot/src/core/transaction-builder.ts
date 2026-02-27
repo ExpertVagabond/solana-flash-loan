@@ -86,10 +86,11 @@ export async function buildArbitrageTransaction(
   const SOL_MINT = "So11111111111111111111111111111111111111112";
   const involvesSol = opportunity.tokenA === SOL_MINT || opportunity.tokenB === SOL_MINT;
 
-  // Fetch swap instructions for both legs in parallel
+  // Fetch swap instructions — leg 2 uses tokenLedger to read actual leg 1 output
+  // This prevents InsufficientFunds (6024) when leg 1 output differs from quote
   const [swapIxLeg1, swapIxLeg2] = await Promise.all([
     jupiterClient.getSwapInstructions(quoteLeg1, borrower.publicKey, !involvesSol),
-    jupiterClient.getSwapInstructions(quoteLeg2, borrower.publicKey, !involvesSol),
+    jupiterClient.getSwapInstructions(quoteLeg2, borrower.publicKey, !involvesSol, true),
   ]);
 
   // 2. Build flash loan borrow/repay instructions
@@ -120,7 +121,10 @@ export async function buildArbitrageTransaction(
     swapIxLeg1.swapInstruction,
     ...(swapIxLeg1.cleanupInstruction ? [swapIxLeg1.cleanupInstruction] : []),
 
-    // Jupiter leg 2: tokenB -> tokenA (setup + swap + cleanup)
+    // Jupiter leg 2: tokenB -> tokenA (tokenLedger + setup + swap + cleanup)
+    // tokenLedger snapshots the intermediate token balance so leg 2 uses
+    // the ACTUAL output from leg 1, not the pre-quoted amount
+    ...(swapIxLeg2.tokenLedgerInstruction ? [swapIxLeg2.tokenLedgerInstruction] : []),
     ...swapIxLeg2.setupInstructions,
     swapIxLeg2.swapInstruction,
     ...(swapIxLeg2.cleanupInstruction ? [swapIxLeg2.cleanupInstruction] : []),
@@ -268,11 +272,11 @@ export async function buildTriangularTransaction(
   const involvesSol = [route.tokenA, route.tokenB, route.tokenC].includes(SOL_MINT);
   const wrapSol = !involvesSol;
 
-  // Fetch all 3 swap instructions using cached quotes (triangular routes are complex)
+  // Fetch all 3 swap instructions — legs 2 & 3 use tokenLedger for actual amounts
   const [swapIx1, swapIx2, swapIx3] = await Promise.all([
     jupiterClient.getSwapInstructions(opportunity.quoteLeg1, borrower.publicKey, wrapSol),
-    jupiterClient.getSwapInstructions(opportunity.quoteLeg2, borrower.publicKey, wrapSol),
-    jupiterClient.getSwapInstructions(opportunity.quoteLeg3, borrower.publicKey, wrapSol),
+    jupiterClient.getSwapInstructions(opportunity.quoteLeg2, borrower.publicKey, wrapSol, true),
+    jupiterClient.getSwapInstructions(opportunity.quoteLeg3, borrower.publicKey, wrapSol, true),
   ]);
 
   // Flash loan borrow/repay
@@ -302,12 +306,14 @@ export async function buildTriangularTransaction(
     swapIx1.swapInstruction,
     ...(swapIx1.cleanupInstruction ? [swapIx1.cleanupInstruction] : []),
 
-    // Leg 2: B → C
+    // Leg 2: B → C (tokenLedger for actual leg 1 output)
+    ...(swapIx2.tokenLedgerInstruction ? [swapIx2.tokenLedgerInstruction] : []),
     ...swapIx2.setupInstructions,
     swapIx2.swapInstruction,
     ...(swapIx2.cleanupInstruction ? [swapIx2.cleanupInstruction] : []),
 
-    // Leg 3: C → A
+    // Leg 3: C → A (tokenLedger for actual leg 2 output)
+    ...(swapIx3.tokenLedgerInstruction ? [swapIx3.tokenLedgerInstruction] : []),
     ...swapIx3.setupInstructions,
     swapIx3.swapInstruction,
     ...(swapIx3.cleanupInstruction ? [swapIx3.cleanupInstruction] : []),

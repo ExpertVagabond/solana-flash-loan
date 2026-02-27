@@ -138,12 +138,17 @@ export class PairScanner {
     tokenB: string,
     borrowAmount: bigint
   ): Promise<ArbitrageOpportunity | null> {
+    // Use direct routes only — single-hop through one pool.
+    // Multi-hop routes go stale in <1s and cause 100% Jupiter 6024 failure rate.
+    const directOnly = true;
+
     // Leg 1: tokenA -> tokenB
     const quoteLeg1 = await this.jupiter.getQuote(
       tokenA,
       tokenB,
       borrowAmount.toString(),
-      this.slippageBps
+      this.slippageBps,
+      directOnly
     );
 
     const leg1Out = BigInt(quoteLeg1.outAmount);
@@ -157,7 +162,8 @@ export class PairScanner {
       tokenB,
       tokenA,
       leg1Out.toString(),
-      this.slippageBps
+      this.slippageBps,
+      directOnly
     );
 
     const leg2Out = BigInt(quoteLeg2.outAmount);

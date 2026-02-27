@@ -580,7 +580,13 @@ async def build_raw_triangular_transaction(
     # Non-existent tick arrays cause:
     #   - Raydium 0xbbf (AccountOwnedByWrongProgram) — account owned by System
     #   - Orca 0x1796 (TickArraySequenceInvalidIndex) — zero start_index != expected
-    # Raising ValueError here triggers Jupiter fallback in main.py.
+    #
+    # For small swaps ($200), we'll never cross into ta1/ta2. Both Orca and
+    # Raydium only traverse outer arrays when the swap actually crosses that
+    # price range. If ta1/ta2 don't exist on-chain, substitute with the nearest
+    # existing array. The program needs a valid program-owned account but won't
+    # actually read it for small swaps.
+    leg_tick_arrays: list[list[Pubkey]] = []  # resolved [ta0, ta1, ta2] per leg
     all_ta_info = []  # (pubkey, expected_start, leg_index, ta_index)
     for i, edge in enumerate(edges):
         pool = edge.pool_state
@@ -592,26 +598,61 @@ async def build_raw_triangular_transaction(
     try:
         ta_pks_only = [info[0] for info in all_ta_info]
         ta_resp = await rpc.get_multiple_accounts(ta_pks_only, _Confirmed)
-        missing = []
-        for idx, (pk, expected_start, leg_idx, ta_idx) in enumerate(all_ta_info):
+
+        # Build existence map and resolve substitutions per leg
+        exists = [False] * len(all_ta_info)
+        for idx in range(len(all_ta_info)):
             acct = ta_resp.value[idx] if ta_resp.value else None
-            if acct is None:
+            exists[idx] = acct is not None
+
+        # Group by leg (3 tick arrays each)
+        for leg_idx in range(len(edges)):
+            base = leg_idx * 3
+            ta_pks_leg = [all_ta_info[base + j][0] for j in range(3)]
+            ta_exists = [exists[base + j] for j in range(3)]
+
+            if not ta_exists[0]:
+                # ta0 (current tick) MUST exist — this pool has no liquidity
                 pool = edges[leg_idx].pool_state
-                missing.append(
-                    f"leg{leg_idx}/ta{ta_idx} "
+                raise ValueError(
+                    f"ta0 missing for leg{leg_idx} "
                     f"(dex={pool.dex}, tick={pool.tick}, "
-                    f"start={expected_start}, pk={str(pk)[:8]})"
+                    f"pool={pool.pool_address[:8]})"
                 )
-        if missing:
-            raise ValueError(
-                f"Tick arrays not initialized on-chain: {'; '.join(missing)}"
-            )
+
+            # Substitute missing outer arrays with nearest existing one
+            resolved = list(ta_pks_leg)
+            if not ta_exists[1]:
+                resolved[1] = resolved[0]  # ta1 missing → use ta0
+                pool = edges[leg_idx].pool_state
+                logger.debug(
+                    f"  leg{leg_idx}: ta1 missing, substituting ta0 "
+                    f"(dex={pool.dex}, tick={pool.tick})"
+                )
+            if not ta_exists[2]:
+                resolved[2] = resolved[1]  # ta2 missing → use ta1 (or ta0)
+                pool = edges[leg_idx].pool_state
+                logger.debug(
+                    f"  leg{leg_idx}: ta2 missing, substituting "
+                    f"{'ta1' if ta_exists[1] else 'ta0'} "
+                    f"(dex={pool.dex}, tick={pool.tick})"
+                )
+
+            leg_tick_arrays.append(resolved)
+
     except ValueError:
         raise  # Re-raise tick array validation errors
     except Exception as e:
         logger.debug(f"Tick array validation failed (proceeding anyway): {e}")
+        # Fall back to derived arrays without substitution
+        leg_tick_arrays = []
+        for i, edge in enumerate(edges):
+            pool = edge.pool_state
+            a_to_b = (edge.from_mint == pool.token_mint_a)
+            ta_pks = get_swap_tick_array_pks(pool, a_to_b)
+            leg_tick_arrays.append([pk for pk, _ in ta_pks])
 
-    # Build 3 raw swap instructions
+    # Build 3 raw swap instructions with resolved tick arrays
     swap_ixs = []
     current_amount = opportunity.borrow_amount
 
@@ -634,6 +675,7 @@ async def build_raw_triangular_transaction(
             token_account_a=token_account_a,
             token_account_b=token_account_b,
             min_out=0,  # Flash loan repay is the profitability guard
+            tick_array_pks=leg_tick_arrays[i] if leg_tick_arrays else None,
         )
         swap_ixs.append(swap_ix)
 

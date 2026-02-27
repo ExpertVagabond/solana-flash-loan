@@ -54,6 +54,7 @@ export interface SwapInstructionsResponse {
 }
 
 export interface DeserializedSwapInstructions {
+  tokenLedgerInstruction: TransactionInstruction | null;
   setupInstructions: TransactionInstruction[];
   swapInstruction: TransactionInstruction;
   cleanupInstruction: TransactionInstruction | null;
@@ -290,16 +291,20 @@ export class JupiterClient {
   async getSwapInstructions(
     quote: JupiterQuote,
     userPublicKey: PublicKey,
-    wrapAndUnwrapSol = true
+    wrapAndUnwrapSol = true,
+    useTokenLedger = false
   ): Promise<DeserializedSwapInstructions> {
     const url = `${JUPITER_API_BASE}/swap-instructions`;
-    const body = {
+    const body: Record<string, unknown> = {
       quoteResponse: quote,
       userPublicKey: userPublicKey.toBase58(),
       wrapAndUnwrapSol,
       dynamicComputeUnitLimit: true,
       prioritizationFeeLamports: 0, // we set our own compute budget
     };
+    if (useTokenLedger) {
+      body.useTokenLedger = true;
+    }
 
     const data: SwapInstructionsResponse = await this.fetchWithRetry(url, {
       method: "POST",
@@ -314,6 +319,9 @@ export class JupiterClient {
     }
 
     return {
+      tokenLedgerInstruction: data.tokenLedgerInstruction
+        ? deserializeInstruction(data.tokenLedgerInstruction)
+        : null,
       setupInstructions: (data.setupInstructions || []).map(
         deserializeInstruction
       ),

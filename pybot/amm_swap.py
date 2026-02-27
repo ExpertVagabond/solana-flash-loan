@@ -11,6 +11,7 @@ preserving the exact pool-to-pool price discrepancies the scanner detects.
 import hashlib
 import math
 import struct
+from typing import Optional
 
 from solders.pubkey import Pubkey
 from solders.instruction import Instruction, AccountMeta
@@ -143,6 +144,7 @@ def build_orca_whirlpool_swap_ix(
     token_account_a: Pubkey,
     token_account_b: Pubkey,
     min_out: int = 0,
+    tick_array_pks: Optional[list[Pubkey]] = None,
 ) -> Instruction:
     """Build Orca Whirlpool swap instruction.
 
@@ -167,15 +169,18 @@ def build_orca_whirlpool_swap_ix(
     vault_a = Pubkey.from_string(pool.token_vault_a)
     vault_b = Pubkey.from_string(pool.token_vault_b)
 
-    # Derive tick arrays: 3 consecutive arrays in swap direction
-    direction = -1 if a_to_b else 1
-    ta0_start = tick_array_start_index(pool.tick, pool.tick_spacing, 0, ORCA_TICK_ARRAY_SIZE)
-    ta1_start = tick_array_start_index(pool.tick, pool.tick_spacing, direction, ORCA_TICK_ARRAY_SIZE)
-    ta2_start = tick_array_start_index(pool.tick, pool.tick_spacing, direction * 2, ORCA_TICK_ARRAY_SIZE)
+    if tick_array_pks and len(tick_array_pks) == 3:
+        ta0, ta1, ta2 = tick_array_pks
+    else:
+        # Derive tick arrays: 3 consecutive arrays in swap direction
+        direction = -1 if a_to_b else 1
+        ta0_start = tick_array_start_index(pool.tick, pool.tick_spacing, 0, ORCA_TICK_ARRAY_SIZE)
+        ta1_start = tick_array_start_index(pool.tick, pool.tick_spacing, direction, ORCA_TICK_ARRAY_SIZE)
+        ta2_start = tick_array_start_index(pool.tick, pool.tick_spacing, direction * 2, ORCA_TICK_ARRAY_SIZE)
 
-    ta0 = derive_orca_tick_array(whirlpool_pk, ta0_start)
-    ta1 = derive_orca_tick_array(whirlpool_pk, ta1_start)
-    ta2 = derive_orca_tick_array(whirlpool_pk, ta2_start)
+        ta0 = derive_orca_tick_array(whirlpool_pk, ta0_start)
+        ta1 = derive_orca_tick_array(whirlpool_pk, ta1_start)
+        ta2 = derive_orca_tick_array(whirlpool_pk, ta2_start)
 
     oracle = derive_orca_oracle(whirlpool_pk)
 
@@ -219,6 +224,7 @@ def build_raydium_clmm_swap_ix(
     input_token_account: Pubkey,
     output_token_account: Pubkey,
     min_out: int = 0,
+    tick_array_pks: Optional[list[Pubkey]] = None,
 ) -> Instruction:
     """Build Raydium CLMM swap instruction.
 
@@ -252,16 +258,19 @@ def build_raydium_clmm_swap_ix(
     input_vault = vault_a if a_to_b else vault_b
     output_vault = vault_b if a_to_b else vault_a
 
-    # Derive tick arrays: 3 consecutive arrays in swap direction
-    # Raydium CLMM uses 60 ticks per array (not 88 like Orca)
-    direction = -1 if a_to_b else 1
-    ta0_start = tick_array_start_index(pool.tick, pool.tick_spacing, 0, RAYDIUM_TICK_ARRAY_SIZE)
-    ta1_start = tick_array_start_index(pool.tick, pool.tick_spacing, direction, RAYDIUM_TICK_ARRAY_SIZE)
-    ta2_start = tick_array_start_index(pool.tick, pool.tick_spacing, direction * 2, RAYDIUM_TICK_ARRAY_SIZE)
+    if tick_array_pks and len(tick_array_pks) == 3:
+        ta0, ta1, ta2 = tick_array_pks
+    else:
+        # Derive tick arrays: 3 consecutive arrays in swap direction
+        # Raydium CLMM uses 60 ticks per array (not 88 like Orca)
+        direction = -1 if a_to_b else 1
+        ta0_start = tick_array_start_index(pool.tick, pool.tick_spacing, 0, RAYDIUM_TICK_ARRAY_SIZE)
+        ta1_start = tick_array_start_index(pool.tick, pool.tick_spacing, direction, RAYDIUM_TICK_ARRAY_SIZE)
+        ta2_start = tick_array_start_index(pool.tick, pool.tick_spacing, direction * 2, RAYDIUM_TICK_ARRAY_SIZE)
 
-    ta0 = derive_raydium_tick_array(pool_pk, ta0_start)
-    ta1 = derive_raydium_tick_array(pool_pk, ta1_start)
-    ta2 = derive_raydium_tick_array(pool_pk, ta2_start)
+        ta0 = derive_raydium_tick_array(pool_pk, ta0_start)
+        ta1 = derive_raydium_tick_array(pool_pk, ta1_start)
+        ta2 = derive_raydium_tick_array(pool_pk, ta2_start)
 
     # sqrt_price_limit: push to boundary in swap direction
     sqrt_price_limit = MIN_SQRT_PRICE_X64 if a_to_b else MAX_SQRT_PRICE_X64
@@ -333,6 +342,7 @@ def build_raw_swap_ix(
     token_account_a: Pubkey,
     token_account_b: Pubkey,
     min_out: int = 0,
+    tick_array_pks: Optional[list[Pubkey]] = None,
 ) -> Instruction:
     """Build a raw swap instruction, dispatching to the correct DEX builder.
 
@@ -344,6 +354,9 @@ def build_raw_swap_ix(
         token_account_a: Payer's ATA for token A.
         token_account_b: Payer's ATA for token B.
         min_out: Minimum output amount (0 = no slippage guard, flash loan repay is the guard).
+        tick_array_pks: Pre-resolved tick array pubkeys [ta0, ta1, ta2].
+            If provided, used directly instead of deriving from pool tick.
+            Allows substituting missing outer arrays with nearest existing one.
 
     Returns:
         Solana Instruction ready to include in transaction.
@@ -355,6 +368,7 @@ def build_raw_swap_ix(
         return build_orca_whirlpool_swap_ix(
             pool, payer, amount_in, a_to_b,
             token_account_a, token_account_b, min_out,
+            tick_array_pks=tick_array_pks,
         )
     elif pool.dex == "raydium_clmm":
         input_acct = token_account_a if a_to_b else token_account_b
@@ -362,6 +376,7 @@ def build_raw_swap_ix(
         return build_raydium_clmm_swap_ix(
             pool, payer, amount_in, a_to_b,
             input_acct, output_acct, min_out,
+            tick_array_pks=tick_array_pks,
         )
     else:
         raise ValueError(
