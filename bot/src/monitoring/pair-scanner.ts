@@ -99,7 +99,7 @@ export class PairScanner {
 
   /**
    * Scan a single pair for arbitrage opportunity.
-   * Uses per-pair borrow sizing to optimize for liquidity depth.
+   * borrowAmount is passed through directly — caller controls sizing.
    */
   async scanPair(
     pair: string,
@@ -107,18 +107,12 @@ export class PairScanner {
     tokenB: string,
     borrowAmount: bigint
   ): Promise<ArbitrageOpportunity | null> {
-    // Determine optimal borrow for this pair's target token
-    const targetPrefix = tokenB.slice(0, 8);
-    const override = PAIR_BORROW_OVERRIDES[targetPrefix];
-    const effectiveBorrow =
-      override !== undefined && override > 0n ? override : borrowAmount;
-
     try {
       const opportunity = await this.scanDirection(
         pair,
         tokenA,
         tokenB,
-        effectiveBorrow
+        borrowAmount
       );
 
       // Track best spread for learning

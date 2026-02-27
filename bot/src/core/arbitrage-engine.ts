@@ -29,6 +29,7 @@ import { JitoClient } from "../providers/jito-client";
 import { MultiDexClient, CrossDexOpportunity } from "../providers/multi-dex-client";
 import { OracleClient } from "../providers/oracle-client";
 import { NewPoolMonitor, NewPoolEvent } from "../monitoring/new-pool-monitor";
+import { BackrunMonitor, BackrunSignal } from "../monitoring/backrun-monitor";
 
 export class ArbitrageEngine {
   private connection: Connection;
@@ -44,6 +45,7 @@ export class ArbitrageEngine {
   private oracle: OracleClient;
   private triangularScanner: TriangularScanner;
   private poolMonitor: NewPoolMonitor | null = null;
+  private backrunMonitor: BackrunMonitor | null = null;
   private running = false;
   private consecutiveFailures = 0;
   private metricsIntervalId: ReturnType<typeof setInterval> | null = null;
@@ -95,6 +97,14 @@ export class ArbitrageEngine {
       jupiterClient,
       (event: NewPoolEvent) => this.handleNewPool(event)
     );
+
+    // Backrun monitor — watches for large swaps that displace price
+    this.backrunMonitor = new BackrunMonitor(
+      connection,
+      logger,
+      jupiterClient,
+      (signal: BackrunSignal) => this.handleBackrunSignal(signal)
+    );
   }
 
   /** Handle a new pool discovery — add to dynamic scanning if tradeable */
@@ -130,6 +140,94 @@ export class ArbitrageEngine {
         { pair: pairKey, dex: event.dex, dynamicPairs: this.dynamicPairs.size },
         "DYNAMIC PAIR ADDED to scanner"
       );
+
+      // SNIPE: Immediately probe the new pool — don't wait for next scan cycle
+      this.snipeNewPool(pairKey, unknownMint).catch(() => {});
+    }
+  }
+
+  /** Aggressively probe a newly discovered USDC pool at multiple sizes */
+  private async snipeNewPool(pairKey: string, targetMint: string): Promise<void> {
+    const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    const SNIPE_SIZES = [10_000_000n, 50_000_000n, 200_000_000n, 1_000_000_000n];
+
+    let bestOpp: ArbitrageOpportunity | null = null;
+    for (const size of SNIPE_SIZES) {
+      try {
+        const opp = await this.scanner.scanPair(pairKey, USDC, targetMint, size);
+        if (opp && (!bestOpp || opp.profitBps > bestOpp.profitBps)) {
+          bestOpp = opp;
+        }
+      } catch {
+        break; // No route — skip larger sizes
+      }
+    }
+
+    if (bestOpp && bestOpp.profitBps >= this.config.minProfitBps) {
+      this.metrics.opportunitiesFound++;
+      this.logger.info(
+        {
+          pair: pairKey,
+          profitBps: bestOpp.profitBps,
+          expectedProfit: bestOpp.expectedProfit.toString(),
+          borrowUsed: bestOpp.borrowAmount.toString(),
+        },
+        "NEW POOL SNIPE — opportunity found!"
+      );
+
+      if (!this.config.dryRun) {
+        await this.executeArbitrage(bestOpp);
+      }
+    }
+  }
+
+  /** Handle a large swap detection — immediately probe for backrun arb */
+  private async handleBackrunSignal(signal: BackrunSignal): Promise<void> {
+    const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+    // Someone sold a large amount of TOKEN for USDC → TOKEN price dropped on that DEX
+    // We can buy TOKEN cheap and sell on another DEX
+    // Or: someone bought a large amount of TOKEN with USDC → TOKEN price rose
+    // We can sell TOKEN on that DEX and buy cheaper elsewhere
+
+    // Only handle swaps involving USDC (our borrow token)
+    if (signal.tokenIn !== USDC && signal.tokenOut !== USDC) return;
+
+    const targetToken = signal.tokenIn === USDC ? signal.tokenOut : signal.tokenIn;
+    const pairKey = `${targetToken.slice(0, 8)}/USDC`;
+
+    // Probe at multiple sizes — the displacement might only be profitable at certain sizes
+    const SIZES = [50_000_000n, 200_000_000n, 1_000_000_000n, 5_000_000_000n];
+
+    let bestOpp: ArbitrageOpportunity | null = null;
+    for (const size of SIZES) {
+      try {
+        const opp = await this.scanner.scanPair(pairKey, USDC, targetToken, size);
+        if (opp && (!bestOpp || opp.profitBps > bestOpp.profitBps)) {
+          bestOpp = opp;
+        }
+      } catch {
+        break;
+      }
+    }
+
+    if (bestOpp && bestOpp.profitBps >= this.config.minProfitBps) {
+      this.metrics.opportunitiesFound++;
+      this.logger.info(
+        {
+          pair: pairKey,
+          profitBps: bestOpp.profitBps,
+          expectedProfit: bestOpp.expectedProfit.toString(),
+          borrowUsed: bestOpp.borrowAmount.toString(),
+          triggerDex: signal.dex,
+          triggerSig: signal.signature.slice(0, 16) + "...",
+        },
+        "BACKRUN OPPORTUNITY — price displacement detected!"
+      );
+
+      if (!this.config.dryRun) {
+        await this.executeArbitrage(bestOpp);
+      }
     }
   }
 
@@ -139,10 +237,15 @@ export class ArbitrageEngine {
     // Pre-flight checks
     await this.preflight();
 
-    // Start new pool monitor (WebSocket + DexScreener) — non-blocking to avoid WS errors stalling startup
+    // Start monitors — non-blocking to avoid WS errors stalling startup
     if (this.poolMonitor) {
       this.poolMonitor.start().catch((err) => {
         this.logger.warn({ error: (err as Error).message }, "Pool monitor start failed — continuing without");
+      });
+    }
+    if (this.backrunMonitor) {
+      this.backrunMonitor.start().catch((err) => {
+        this.logger.warn({ error: (err as Error).message }, "Backrun monitor start failed — continuing without");
       });
     }
 
@@ -167,51 +270,82 @@ export class ArbitrageEngine {
       "Arbitrage engine STARTED"
     );
 
+    // Borrow sizes to test per pair (USDC 6 decimals)
+    const BORROW_SIZES = [
+      20_000_000n,    // $20
+      200_000_000n,   // $200
+      1_000_000_000n, // $1,000
+      5_000_000_000n, // $5,000
+    ];
+
+    // Hot pairs get scanned every cycle; cold pairs rotate
+    const HOT_PAIRS = new Set([
+      "SOL/USDC", "JUP/USDC", "RAY/USDC", "BONK/USDC", "WIF/USDC",
+      "TRUMP/USDC", "FARTCOIN/USDC", "POPCAT/USDC", "USDT/USDC",
+    ]);
+    let coldPairOffset = 0;
+    const COLD_BATCH_SIZE = 8;
+
     // Main loop
     while (this.running) {
       const cycleStart = Date.now();
       this.metrics.scanCycles++;
 
       try {
-        for (let i = 0; i < this.config.pairs.length; i++) {
-          if (!this.running) break;
-          const pair = this.config.pairs[i];
+        // Phase 1: Scan pairs with multiple borrow sizes
+        // Hot pairs: every cycle. Cold pairs: rotate in batches.
+        const coldPairs = this.config.pairs.filter((p) => !HOT_PAIRS.has(p));
+        const coldBatch = coldPairs.slice(coldPairOffset, coldPairOffset + COLD_BATCH_SIZE);
+        coldPairOffset = (coldPairOffset + COLD_BATCH_SIZE) % Math.max(coldPairs.length, 1);
 
-          // Minimal stagger — rate limiter handles API pacing
-          if (i > 0) {
-            await new Promise((r) => setTimeout(r, 50));
-          }
+        const pairsThisCycle = [
+          ...this.config.pairs.filter((p) => HOT_PAIRS.has(p)),
+          ...coldBatch,
+        ];
+
+        for (let i = 0; i < pairsThisCycle.length; i++) {
+          if (!this.running) break;
+          const pair = pairsThisCycle[i];
+
+          if (i > 0) await new Promise((r) => setTimeout(r, 30));
 
           const [targetToken, quoteToken] = parsePair(pair);
 
-          // We borrow quoteToken (USDC) via flash loan, so:
-          //   tokenA = quoteToken (flash loan / borrow token)
-          //   tokenB = targetToken (intermediate / swap token)
-          // Flow: borrow USDC -> swap USDC->TARGET -> swap TARGET->USDC -> repay
-          const opportunity = await this.scanner.scanPair(
-            pair,
-            quoteToken,
-            targetToken,
-            this.config.borrowAmount
-          );
+          // Test multiple borrow sizes — find the one with best profit
+          let bestOpp: ArbitrageOpportunity | null = null;
 
-          if (opportunity) {
+          for (const size of BORROW_SIZES) {
+            if (!this.running) break;
+            try {
+              const opp = await this.scanner.scanPair(pair, quoteToken, targetToken, size);
+              if (opp && (!bestOpp || opp.profitBps > bestOpp.profitBps)) {
+                bestOpp = opp;
+              }
+              // If we found a profitable opportunity, try the next size
+              // but don't waste API calls if this size returned -20+ bps
+              if (opp && opp.profitBps < -20) break;
+            } catch {
+              break; // No route at this size — skip larger sizes
+            }
+          }
+
+          if (bestOpp && bestOpp.profitBps >= this.config.minProfitBps) {
             this.metrics.opportunitiesFound++;
 
             if (this.config.dryRun) {
               this.logger.info(
                 {
                   pair,
-                  profitBps: opportunity.profitBps,
-                  expectedProfit: opportunity.expectedProfit.toString(),
-                  solCosts: opportunity.solCostsInToken.toString(),
+                  profitBps: bestOpp.profitBps,
+                  expectedProfit: bestOpp.expectedProfit.toString(),
+                  borrowUsed: bestOpp.borrowAmount.toString(),
                 },
                 "DRY RUN: would execute arbitrage"
               );
               continue;
             }
 
-            await this.executeArbitrage(opportunity);
+            await this.executeArbitrage(bestOpp);
           }
         }
 
@@ -219,11 +353,9 @@ export class ArbitrageEngine {
         for (const dynPair of this.dynamicPairs) {
           if (!this.running) break;
           try {
-            // Dynamic pairs use format "MINT_PREFIX/USDC" — need full mint
             const parts = dynPair.split("/");
             if (parts.length !== 2) continue;
 
-            // Find the full mint from discovered pools
             const pool = this.poolMonitor?.discoveredPools.find(
               (p) => p.tokenA.startsWith(parts[0]) || p.tokenB.startsWith(parts[0])
             );
@@ -232,22 +364,26 @@ export class ArbitrageEngine {
             const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
             const targetMint = pool.tokenA === USDC ? pool.tokenB : pool.tokenA;
 
-            const opportunity = await this.scanner.scanPair(
-              dynPair,
-              USDC,
-              targetMint,
-              20_000_000n // $20 for new/unproven tokens
-            );
+            // Probe new pools at multiple sizes — fresh liquidity is often mispriced
+            let bestOpp: ArbitrageOpportunity | null = null;
+            for (const size of [10_000_000n, 50_000_000n, 200_000_000n]) {
+              try {
+                const opp = await this.scanner.scanPair(dynPair, USDC, targetMint, size);
+                if (opp && (!bestOpp || opp.profitBps > bestOpp.profitBps)) {
+                  bestOpp = opp;
+                }
+              } catch { break; }
+            }
 
-            if (opportunity) {
+            if (bestOpp && bestOpp.profitBps >= this.config.minProfitBps) {
               this.metrics.opportunitiesFound++;
               if (this.config.dryRun) {
                 this.logger.info(
-                  { pair: dynPair, profitBps: opportunity.profitBps, source: "new-pool" },
+                  { pair: dynPair, profitBps: bestOpp.profitBps, borrow: bestOpp.borrowAmount.toString(), source: "new-pool" },
                   "DRY RUN: new pool arb found"
                 );
               } else {
-                await this.executeArbitrage(opportunity);
+                await this.executeArbitrage(bestOpp);
               }
             }
           } catch (err) {
@@ -355,6 +491,7 @@ export class ArbitrageEngine {
     // Cleanup
     if (this.metricsIntervalId) clearInterval(this.metricsIntervalId);
     if (this.poolMonitor) this.poolMonitor.stop();
+    if (this.backrunMonitor) this.backrunMonitor.stop();
     printMetricsSummary(this.metrics, this.logger);
     this.logger.info(
       { dynamicPairsDiscovered: this.dynamicPairs.size },
