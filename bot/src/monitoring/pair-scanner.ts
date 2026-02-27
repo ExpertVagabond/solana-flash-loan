@@ -197,20 +197,11 @@ export class PairScanner {
         },
         "OPPORTUNITY FOUND"
       );
-      return opportunity;
     }
 
-    this.logger.debug(
-      {
-        pair,
-        profitBps: opportunity.profitBps,
-        threshold: this.minProfitBps,
-        borrowUsed: borrowAmount.toString(),
-      },
-      "Below profit threshold"
-    );
-
-    return null;
+    // Always return the opportunity — let caller decide whether to execute.
+    // This enables spread tracking even for unprofitable scans.
+    return opportunity;
   }
 
   /** Get snapshot of best observed spreads for monitoring. */

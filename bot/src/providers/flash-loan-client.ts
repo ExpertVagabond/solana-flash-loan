@@ -137,4 +137,33 @@ export class FlashLoanClient {
       })
       .instruction();
   }
+
+  /** Update pool fee and/or active status. Requires admin authority. */
+  async updatePoolConfig(
+    admin: Keypair,
+    connection: Connection,
+    newFeeBasisPoints?: number,
+    isActive?: boolean
+  ): Promise<string> {
+    const ix = await this.program.methods
+      .updatePoolConfig(
+        newFeeBasisPoints !== undefined ? newFeeBasisPoints : null,
+        isActive !== undefined ? isActive : null
+      )
+      .accountsStrict({
+        pool: this.poolPda,
+        admin: admin.publicKey,
+      })
+      .instruction();
+
+    const { Transaction } = await import("@solana/web3.js");
+    const { blockhash } = await connection.getLatestBlockhash();
+    const tx = new Transaction().add(ix);
+    tx.recentBlockhash = blockhash;
+    tx.feePayer = admin.publicKey;
+    tx.sign(admin);
+    const sig = await connection.sendRawTransaction(tx.serialize());
+    await connection.confirmTransaction(sig, "confirmed");
+    return sig;
+  }
 }

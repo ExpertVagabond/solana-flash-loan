@@ -302,6 +302,11 @@ export class ArbitrageEngine {
           ...coldBatch,
         ];
 
+        // Track best spread this cycle for logging
+        let cycleBestPair = "";
+        let cycleBestBps = -9999;
+        let cycleScanned = 0;
+
         for (let i = 0; i < pairsThisCycle.length; i++) {
           if (!this.running) break;
           const pair = pairsThisCycle[i];
@@ -316,12 +321,17 @@ export class ArbitrageEngine {
           try {
             const opp = await this.scanner.scanPair(pair, quoteToken, targetToken, PRIMARY_BORROW);
             if (opp) {
+              cycleScanned++;
+              if (opp.profitBps > cycleBestBps) {
+                cycleBestBps = opp.profitBps;
+                cycleBestPair = pair;
+              }
               bestOpp = opp;
               // Near profitable? Try larger size for better absolute profit
               if (opp.profitBps >= -5) {
                 try {
                   const opp2 = await this.scanner.scanPair(pair, quoteToken, targetToken, SECONDARY_BORROW);
-                  if (opp2 && opp2.profitBps > opp.profitBps) bestOpp = opp2;
+                  if (opp2 && opp2.profitBps > bestOpp.profitBps) bestOpp = opp2;
                 } catch { /* no route at larger size */ }
               }
             }
@@ -346,6 +356,20 @@ export class ArbitrageEngine {
             await this.executeArbitrage(bestOpp);
           }
         }
+
+        // Log cycle summary — best spread seen
+        const elapsed = Date.now() - cycleStart;
+        this.logger.info(
+          {
+            cycle: this.metrics.scanCycles,
+            scanned: cycleScanned,
+            bestPair: cycleBestPair || "none",
+            bestBps: cycleBestBps > -9999 ? cycleBestBps : null,
+            dynamicPairs: this.dynamicPairs.size,
+            elapsedMs: elapsed,
+          },
+          "SCAN CYCLE"
+        );
 
         // Phase 1b: Scan dynamically discovered pairs (from new pool monitor)
         const pairsToRemove: string[] = [];
@@ -757,43 +781,43 @@ export class ArbitrageEngine {
           jitoTipInstruction,
         });
 
-      // Simulate first
-      const sim = await simulateTransaction(
-        this.connection,
-        tx,
-        this.logger
-      );
-
-      if (!sim.success) {
-        this.metrics.simulationFailures++;
-        this.logger.warn(
-          { pair: opportunity.pair },
-          "Skipping — simulation failed"
+      // For thin-margin opportunities (< 5 bps), skip simulation and send directly.
+      // Flash loans are atomic — if the swap fails, the entire tx reverts (no funds lost).
+      // Simulation adds ~1s latency that kills razor-thin arbs.
+      // For larger opportunities (>= 5 bps), simulate first as a safety check.
+      if (opportunity.profitBps >= 5) {
+        const sim = await simulateTransaction(
+          this.connection,
+          tx,
+          this.logger
         );
-        return;
+        if (!sim.success) {
+          this.metrics.simulationFailures++;
+          this.logger.warn(
+            { pair: opportunity.pair },
+            "Skipping — simulation failed"
+          );
+          return;
+        }
       }
 
       // Send via Jito or regular RPC
       let sig: string;
 
       if (this.jitoClient && this.config.useJito) {
-        // Jito path: send single tx directly to block engine
         sig = await this.jitoClient.sendTransaction(tx);
-
         this.logger.info(
-          { signature: sig, pair: opportunity.pair, via: "jito" },
+          { signature: sig, pair: opportunity.pair, profitBps: opportunity.profitBps, via: "jito" },
           "Transaction SENT via Jito"
         );
         this.metrics.jitoSubmissions++;
       } else {
-        // Standard RPC path — skip preflight since we already simulated (W-05 fix)
         sig = await this.connection.sendTransaction(tx, {
           skipPreflight: true,
           maxRetries: 2,
         });
-
         this.logger.info(
-          { signature: sig, pair: opportunity.pair, via: "rpc" },
+          { signature: sig, pair: opportunity.pair, profitBps: opportunity.profitBps, via: "rpc" },
           "Transaction SENT via RPC"
         );
       }
