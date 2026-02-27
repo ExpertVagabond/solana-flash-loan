@@ -825,6 +825,32 @@ class ArbitrageEngine:
 
             mode = "RAW" if used_raw else "JUPITER"
             success, logs, units = await simulate_transaction(self.rpc, tx)
+
+            # If raw swap simulation fails, retry with Jupiter before giving up
+            if not success and used_raw:
+                logger.info(
+                    f"Raw simulation failed, retrying with Jupiter: {path_str}"
+                )
+                try:
+                    tx, blockhash, last_valid = await build_triangular_transaction(
+                        rpc=self.rpc,
+                        borrower=self.borrower,
+                        borrower_token_account_a=self.borrower_usdc_ata,
+                        flash_loan=self.flash_loan,
+                        opportunity=opp,
+                        jupiter_api_key=self.config.jupiter_api_key,
+                        slippage_bps=100,
+                        compute_unit_price=50000,
+                        compute_unit_limit=600000,
+                        jito_tip_ix=jito_tip_ix,
+                    )
+                    mode = "JUPITER_FALLBACK"
+                    success, logs, units = await simulate_transaction(
+                        self.rpc, tx
+                    )
+                except Exception as jup_err:
+                    logger.warning(f"Jupiter fallback also failed: {jup_err}")
+
             if not success:
                 self.metrics.simulation_failures += 1
                 logger.warning(f"Triangular simulation FAILED ({mode}): {path_str}")
@@ -862,6 +888,7 @@ class ArbitrageEngine:
         from amm_swap import (
             TOKEN_PROGRAM_ID, ORCA_WHIRLPOOL_PROGRAM, RAYDIUM_CLMM_PROGRAM,
             SYSTEM_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID,
+            ORCA_TICK_ARRAY_SIZE, RAYDIUM_TICK_ARRAY_SIZE,
             get_associated_token_address, derive_orca_tick_array,
             derive_raydium_tick_array, derive_orca_oracle,
             tick_array_start_index,
@@ -900,7 +927,7 @@ class ArbitrageEngine:
                 a_to_b = (edge.from_mint == pool.token_mint_a)
                 direction = -1 if a_to_b else 1
                 for off in (0, direction, direction * 2):
-                    start = tick_array_start_index(pool.tick, pool.tick_spacing, off)
+                    start = tick_array_start_index(pool.tick, pool.tick_spacing, off, ORCA_TICK_ARRAY_SIZE)
                     accounts.add(derive_orca_tick_array(pool_pk, start))
 
             elif pool.dex == "raydium_clmm":
@@ -912,7 +939,7 @@ class ArbitrageEngine:
                 a_to_b = (edge.from_mint == pool.token_mint_a)
                 direction = -1 if a_to_b else 1
                 for off in (0, direction, direction * 2):
-                    start = tick_array_start_index(pool.tick, pool.tick_spacing, off)
+                    start = tick_array_start_index(pool.tick, pool.tick_spacing, off, RAYDIUM_TICK_ARRAY_SIZE)
                     accounts.add(derive_raydium_tick_array(pool_pk, start))
 
         return list(accounts)

@@ -43,21 +43,26 @@ MAX_SQRT_PRICE_X64 = 79226673515401279992447579055
 
 # ── Tick Array Math ──
 
-TICK_ARRAY_SIZE = 88  # Both Orca and Raydium use 88 ticks per array
+ORCA_TICK_ARRAY_SIZE = 88    # Orca Whirlpool: 88 ticks per array
+RAYDIUM_TICK_ARRAY_SIZE = 60  # Raydium CLMM: 60 ticks per array
 
 
-def tick_array_start_index(tick: int, tick_spacing: int, offset: int = 0) -> int:
+def tick_array_start_index(
+    tick: int, tick_spacing: int, offset: int = 0,
+    tick_array_size: int = ORCA_TICK_ARRAY_SIZE,
+) -> int:
     """Compute the start tick index for a tick array.
 
     Args:
         tick: Current tick index.
         tick_spacing: Pool's tick spacing.
         offset: Array offset from current (0 = current, +1/-1 = next/prev).
+        tick_array_size: Ticks per array (88 for Orca, 60 for Raydium CLMM).
 
     Returns:
         Start tick index of the array.
     """
-    ticks_in_array = TICK_ARRAY_SIZE * tick_spacing
+    ticks_in_array = tick_array_size * tick_spacing
     real_index = math.floor(tick / ticks_in_array) * ticks_in_array
     return real_index + offset * ticks_in_array
 
@@ -83,9 +88,13 @@ def derive_orca_oracle(whirlpool: Pubkey) -> Pubkey:
 
 
 def derive_raydium_tick_array(pool_id: Pubkey, start_index: int) -> Pubkey:
-    """Derive Raydium CLMM tick array PDA."""
+    """Derive Raydium CLMM tick array PDA.
+
+    Note: Raydium uses big-endian (to_be_bytes) for the start_index seed,
+    unlike most Solana programs which use little-endian.
+    """
     pda, _ = Pubkey.find_program_address(
-        [b"tick_array", bytes(pool_id), struct.pack("<i", start_index)],
+        [b"tick_array", bytes(pool_id), struct.pack(">i", start_index)],
         RAYDIUM_CLMM_PROGRAM,
     )
     return pda
@@ -160,9 +169,9 @@ def build_orca_whirlpool_swap_ix(
 
     # Derive tick arrays: 3 consecutive arrays in swap direction
     direction = -1 if a_to_b else 1
-    ta0_start = tick_array_start_index(pool.tick, pool.tick_spacing, 0)
-    ta1_start = tick_array_start_index(pool.tick, pool.tick_spacing, direction)
-    ta2_start = tick_array_start_index(pool.tick, pool.tick_spacing, direction * 2)
+    ta0_start = tick_array_start_index(pool.tick, pool.tick_spacing, 0, ORCA_TICK_ARRAY_SIZE)
+    ta1_start = tick_array_start_index(pool.tick, pool.tick_spacing, direction, ORCA_TICK_ARRAY_SIZE)
+    ta2_start = tick_array_start_index(pool.tick, pool.tick_spacing, direction * 2, ORCA_TICK_ARRAY_SIZE)
 
     ta0 = derive_orca_tick_array(whirlpool_pk, ta0_start)
     ta1 = derive_orca_tick_array(whirlpool_pk, ta1_start)
@@ -244,10 +253,11 @@ def build_raydium_clmm_swap_ix(
     output_vault = vault_b if a_to_b else vault_a
 
     # Derive tick arrays: 3 consecutive arrays in swap direction
+    # Raydium CLMM uses 60 ticks per array (not 88 like Orca)
     direction = -1 if a_to_b else 1
-    ta0_start = tick_array_start_index(pool.tick, pool.tick_spacing, 0)
-    ta1_start = tick_array_start_index(pool.tick, pool.tick_spacing, direction)
-    ta2_start = tick_array_start_index(pool.tick, pool.tick_spacing, direction * 2)
+    ta0_start = tick_array_start_index(pool.tick, pool.tick_spacing, 0, RAYDIUM_TICK_ARRAY_SIZE)
+    ta1_start = tick_array_start_index(pool.tick, pool.tick_spacing, direction, RAYDIUM_TICK_ARRAY_SIZE)
+    ta2_start = tick_array_start_index(pool.tick, pool.tick_spacing, direction * 2, RAYDIUM_TICK_ARRAY_SIZE)
 
     ta0 = derive_raydium_tick_array(pool_pk, ta0_start)
     ta1 = derive_raydium_tick_array(pool_pk, ta1_start)
@@ -280,6 +290,37 @@ def build_raydium_clmm_swap_ix(
     ]
 
     return Instruction(RAYDIUM_CLMM_PROGRAM, data, accounts)
+
+
+# ── Tick Array Introspection ──
+
+
+def get_swap_tick_array_pks(
+    pool: PoolState, a_to_b: bool
+) -> list[tuple[Pubkey, int]]:
+    """Return (pubkey, expected_start_index) for the 3 tick arrays needed.
+
+    Used for pre-flight validation — batch-fetch these accounts to verify
+    they exist on-chain before building the swap instruction.
+    """
+    pool_pk = Pubkey.from_string(pool.pool_address)
+    direction = -1 if a_to_b else 1
+
+    if pool.dex == "orca":
+        ta_size = ORCA_TICK_ARRAY_SIZE
+        derive_fn = derive_orca_tick_array
+    elif pool.dex == "raydium_clmm":
+        ta_size = RAYDIUM_TICK_ARRAY_SIZE
+        derive_fn = derive_raydium_tick_array
+    else:
+        raise ValueError(f"Unsupported DEX for tick arrays: {pool.dex}")
+
+    results = []
+    for offset in (0, direction, direction * 2):
+        start = tick_array_start_index(pool.tick, pool.tick_spacing, offset, ta_size)
+        pk = derive_fn(pool_pk, start)
+        results.append((pk, start))
+    return results
 
 
 # ── Dispatcher ──

@@ -20,13 +20,15 @@ from solders.compute_budget import set_compute_unit_limit, set_compute_unit_pric
 from solana.rpc.async_api import AsyncClient
 from loguru import logger
 
+from solana.rpc.commitment import Confirmed as _Confirmed
 from flash_loan_client import FlashLoanClient, TOKEN_PROGRAM_ID
 from quote_provider import QuoteProvider
 from scanner import ArbitrageOpportunity
 from amm_swap import (
     build_raw_swap_ix, build_create_ata_idempotent_ix,
-    get_associated_token_address,
+    get_associated_token_address, get_swap_tick_array_pks,
 )
+from pool_decoder import decode_orca_whirlpool, decode_raydium_clmm
 
 
 def _deserialize_jupiter_ix(raw: dict) -> Instruction:
@@ -540,6 +542,75 @@ async def build_raw_triangular_transaction(
         mint_pk = Pubkey.from_string(mint_str)
         ata_cache[mint_str] = get_associated_token_address(borrower_pk, mint_pk)
 
+    # Refresh pool states for fresh tick values.
+    # Stale ticks (from discovery minutes ago) cause:
+    #   - Wrong tick array PDAs → Raydium 0xbbf / Orca 0x1796
+    #   - Wrong price estimates → Orca 0x1 (InsufficientFunds)
+    pool_pks = [Pubkey.from_string(e.pool_state.pool_address) for e in edges]
+    try:
+        multi_resp = await rpc.get_multiple_accounts(pool_pks, _Confirmed)
+        for i, edge in enumerate(edges):
+            acct = multi_resp.value[i] if multi_resp.value else None
+            if acct is None:
+                continue
+            data = bytes(acct.data)
+            pool = edge.pool_state
+            if pool.dex == "orca":
+                fresh = decode_orca_whirlpool(data, pool.pool_address)
+            elif pool.dex == "raydium_clmm":
+                fresh = decode_raydium_clmm(data, pool.pool_address)
+            else:
+                continue
+            if fresh:
+                old_tick = pool.tick
+                pool.tick = fresh.tick
+                pool.sqrt_price_x64 = fresh.sqrt_price_x64
+                pool.price = fresh.price
+                if fresh.liquidity > 0:
+                    pool.liquidity = fresh.liquidity
+                if old_tick != fresh.tick:
+                    logger.debug(
+                        f"  Pool {pool.pool_address[:8]} tick refreshed: "
+                        f"{old_tick} → {fresh.tick}"
+                    )
+    except Exception as e:
+        logger.debug(f"Pool state refresh failed (using stale): {e}")
+
+    # Validate tick arrays exist on-chain BEFORE building swap IXs.
+    # Non-existent tick arrays cause:
+    #   - Raydium 0xbbf (AccountOwnedByWrongProgram) — account owned by System
+    #   - Orca 0x1796 (TickArraySequenceInvalidIndex) — zero start_index != expected
+    # Raising ValueError here triggers Jupiter fallback in main.py.
+    all_ta_info = []  # (pubkey, expected_start, leg_index, ta_index)
+    for i, edge in enumerate(edges):
+        pool = edge.pool_state
+        a_to_b = (edge.from_mint == pool.token_mint_a)
+        ta_pks = get_swap_tick_array_pks(pool, a_to_b)
+        for j, (pk, start) in enumerate(ta_pks):
+            all_ta_info.append((pk, start, i, j))
+
+    try:
+        ta_pks_only = [info[0] for info in all_ta_info]
+        ta_resp = await rpc.get_multiple_accounts(ta_pks_only, _Confirmed)
+        missing = []
+        for idx, (pk, expected_start, leg_idx, ta_idx) in enumerate(all_ta_info):
+            acct = ta_resp.value[idx] if ta_resp.value else None
+            if acct is None:
+                pool = edges[leg_idx].pool_state
+                missing.append(
+                    f"leg{leg_idx}/ta{ta_idx} "
+                    f"(dex={pool.dex}, tick={pool.tick}, "
+                    f"start={expected_start}, pk={str(pk)[:8]})"
+                )
+        if missing:
+            raise ValueError(
+                f"Tick arrays not initialized on-chain: {'; '.join(missing)}"
+            )
+    except ValueError:
+        raise  # Re-raise tick array validation errors
+    except Exception as e:
+        logger.debug(f"Tick array validation failed (proceeding anyway): {e}")
+
     # Build 3 raw swap instructions
     swap_ixs = []
     current_amount = opportunity.borrow_amount
@@ -566,9 +637,12 @@ async def build_raw_triangular_transaction(
         )
         swap_ixs.append(swap_ix)
 
-        # Estimate output for next leg's input
+        # Estimate output for next leg's input.
+        # Pool graph rates overestimate by 1-3% vs executable rates (marginal
+        # rate at current tick vs actual swap output with fees/impact).
+        # Apply 2% haircut to avoid InsufficientFunds on subsequent legs.
         fee_mult = 1 - edge.fee_bps / 10000
-        current_amount = int(current_amount * edge.rate * fee_mult)
+        current_amount = int(current_amount * edge.rate * fee_mult * 0.98)
 
         logger.debug(
             f"  Leg {i}: {from_mint[:6]}→{to_mint[:6]} "
