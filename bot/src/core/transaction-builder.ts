@@ -62,33 +62,53 @@ export async function buildArbitrageTransaction(
 
   logger.debug("Building atomic arbitrage transaction...");
 
-  // Use scanner's cached quotes if available (saves ~2s of re-quoting latency).
-  // The on-chain flash loan repayment check + simulation are the real safety nets —
-  // if quotes are stale, the tx simply reverts with no funds lost.
-  const quoteLeg1 = opportunity.quoteLeg1;
-  const quoteLeg2 = opportunity.quoteLeg2;
-
-  if (!quoteLeg1 || !quoteLeg2) {
-    throw new Error("Missing cached quotes — scanner must attach quoteLeg1/quoteLeg2");
-  }
-
-  const quoteAgeMs = Date.now() - opportunity.timestamp;
+  // Re-quote fresh at execution time — cached quotes go stale in ~5s
+  // and cause Jupiter error 0x1788 (route expired).
+  // The on-chain flash loan repayment check + simulation are the real safety nets.
   logger.debug(
-    { quoteAgeMs, pair: opportunity.pair },
-    "Using cached quotes from scanner"
+    { pair: opportunity.pair },
+    "Re-quoting fresh for execution"
   );
 
-  // Reject quotes older than 30 seconds — too stale for reliable execution
-  if (quoteAgeMs > 30_000) {
-    throw new Error(
-      `Quotes too stale: ${quoteAgeMs}ms old (max 30000ms)`
+  const [freshQuoteLeg1, freshQuoteLeg2] = await Promise.all([
+    jupiterClient.getQuote(
+      opportunity.tokenA,
+      opportunity.tokenB,
+      opportunity.borrowAmount.toString(),
+      slippageBps
+    ),
+    // Leg 2 uses leg 1's output — estimate from original opportunity
+    jupiterClient.getQuote(
+      opportunity.tokenB,
+      opportunity.tokenA,
+      opportunity.leg1OutAmount.toString(),
+      slippageBps
+    ),
+  ]);
+
+  // Verify the fresh quotes are still profitable
+  const freshLeg2Out = BigInt(freshQuoteLeg2.outAmount);
+  if (freshLeg2Out <= opportunity.borrowAmount) {
+    logger.info(
+      {
+        pair: opportunity.pair,
+        borrowAmount: opportunity.borrowAmount.toString(),
+        freshReturn: freshLeg2Out.toString(),
+      },
+      "Fresh quotes no longer profitable — skipping"
     );
+    throw new Error("Fresh quotes no longer profitable");
   }
+
+  // Determine if SOL is involved — if so, disable wrapAndUnwrapSol
+  // to avoid SyncNative IncorrectProgramId conflicts with our existing ATAs
+  const SOL_MINT = "So11111111111111111111111111111111111111112";
+  const involvesSol = opportunity.tokenA === SOL_MINT || opportunity.tokenB === SOL_MINT;
 
   // Fetch swap instructions for both legs in parallel
   const [swapIxLeg1, swapIxLeg2] = await Promise.all([
-    jupiterClient.getSwapInstructions(quoteLeg1, borrower.publicKey),
-    jupiterClient.getSwapInstructions(quoteLeg2, borrower.publicKey),
+    jupiterClient.getSwapInstructions(freshQuoteLeg1, borrower.publicKey, !involvesSol),
+    jupiterClient.getSwapInstructions(freshQuoteLeg2, borrower.publicKey, !involvesSol),
   ]);
 
   // 2. Build flash loan borrow/repay instructions
@@ -255,23 +275,23 @@ export async function buildTriangularTransaction(
     jitoTipInstruction,
   } = params;
 
-  const { quoteLeg1, quoteLeg2, quoteLeg3, route } = opportunity;
+  const { route } = opportunity;
 
   logger.debug(
-    { route: route.name, quoteAgeMs: Date.now() - opportunity.timestamp },
-    "Building 3-leg triangular transaction"
+    { route: route.name },
+    "Building 3-leg triangular transaction — re-quoting fresh"
   );
 
-  // Reject quotes older than 30 seconds
-  if (Date.now() - opportunity.timestamp > 30_000) {
-    throw new Error(`Triangular quotes too stale: ${Date.now() - opportunity.timestamp}ms`);
-  }
+  // Check if SOL is involved in any leg
+  const SOL_MINT = "So11111111111111111111111111111111111111112";
+  const involvesSol = [route.tokenA, route.tokenB, route.tokenC].includes(SOL_MINT);
+  const wrapSol = !involvesSol;
 
-  // Fetch all 3 swap instructions in parallel
+  // Fetch all 3 swap instructions using cached quotes (triangular routes are complex)
   const [swapIx1, swapIx2, swapIx3] = await Promise.all([
-    jupiterClient.getSwapInstructions(quoteLeg1, borrower.publicKey),
-    jupiterClient.getSwapInstructions(quoteLeg2, borrower.publicKey),
-    jupiterClient.getSwapInstructions(quoteLeg3, borrower.publicKey),
+    jupiterClient.getSwapInstructions(opportunity.quoteLeg1, borrower.publicKey, wrapSol),
+    jupiterClient.getSwapInstructions(opportunity.quoteLeg2, borrower.publicKey, wrapSol),
+    jupiterClient.getSwapInstructions(opportunity.quoteLeg3, borrower.publicKey, wrapSol),
   ]);
 
   // Flash loan borrow/repay

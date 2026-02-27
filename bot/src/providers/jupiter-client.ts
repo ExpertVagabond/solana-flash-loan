@@ -289,13 +289,14 @@ export class JupiterClient {
 
   async getSwapInstructions(
     quote: JupiterQuote,
-    userPublicKey: PublicKey
+    userPublicKey: PublicKey,
+    wrapAndUnwrapSol = true
   ): Promise<DeserializedSwapInstructions> {
     const url = `${JUPITER_API_BASE}/swap-instructions`;
     const body = {
       quoteResponse: quote,
       userPublicKey: userPublicKey.toBase58(),
-      wrapAndUnwrapSol: true,
+      wrapAndUnwrapSol,
       dynamicComputeUnitLimit: true,
       prioritizationFeeLamports: 0, // we set our own compute budget
     };
