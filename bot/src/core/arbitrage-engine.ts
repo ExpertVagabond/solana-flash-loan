@@ -52,6 +52,8 @@ export class ArbitrageEngine {
 
   // Dynamic pairs discovered at runtime (from new pool monitor)
   private dynamicPairs: Set<string> = new Set();
+  // Track consecutive failures per dynamic pair — drop after N failures
+  private dynamicPairFailures: Map<string, number> = new Map();
 
   // Cache ATAs per mint
   private ataCache: Map<string, PublicKey> = new Map();
@@ -149,7 +151,7 @@ export class ArbitrageEngine {
   /** Aggressively probe a newly discovered USDC pool at multiple sizes */
   private async snipeNewPool(pairKey: string, targetMint: string): Promise<void> {
     const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-    const SNIPE_SIZES = [10_000_000n, 50_000_000n, 200_000_000n, 1_000_000_000n];
+    const SNIPE_SIZES = [10_000_000n, 100_000_000n];
 
     let bestOpp: ArbitrageOpportunity | null = null;
     for (const size of SNIPE_SIZES) {
@@ -197,7 +199,7 @@ export class ArbitrageEngine {
     const pairKey = `${targetToken.slice(0, 8)}/USDC`;
 
     // Probe at multiple sizes — the displacement might only be profitable at certain sizes
-    const SIZES = [50_000_000n, 200_000_000n, 1_000_000_000n, 5_000_000_000n];
+    const SIZES = [50_000_000n, 500_000_000n];
 
     let bestOpp: ArbitrageOpportunity | null = null;
     for (const size of SIZES) {
@@ -271,11 +273,10 @@ export class ArbitrageEngine {
     );
 
     // Borrow sizes to test per pair (USDC 6 decimals)
+    // Keep small to conserve API quota — 2 sizes covers spread detection
     const BORROW_SIZES = [
-      20_000_000n,    // $20
-      200_000_000n,   // $200
-      1_000_000_000n, // $1,000
-      5_000_000_000n, // $5,000
+      50_000_000n,    // $50 — sweet spot for thin pools
+      500_000_000n,   // $500 — decent size for liquid pairs
     ];
 
     // Hot pairs get scanned every cycle; cold pairs rotate
@@ -307,7 +308,7 @@ export class ArbitrageEngine {
           if (!this.running) break;
           const pair = pairsThisCycle[i];
 
-          if (i > 0) await new Promise((r) => setTimeout(r, 30));
+          if (i > 0) await new Promise((r) => setTimeout(r, 10));
 
           const [targetToken, quoteToken] = parsePair(pair);
 
@@ -323,7 +324,7 @@ export class ArbitrageEngine {
               }
               // If we found a profitable opportunity, try the next size
               // but don't waste API calls if this size returned -20+ bps
-              if (opp && opp.profitBps < -20) break;
+              if (opp && opp.profitBps < -10) break;
             } catch {
               break; // No route at this size — skip larger sizes
             }
@@ -350,6 +351,7 @@ export class ArbitrageEngine {
         }
 
         // Phase 1b: Scan dynamically discovered pairs (from new pool monitor)
+        const pairsToRemove: string[] = [];
         for (const dynPair of this.dynamicPairs) {
           if (!this.running) break;
           try {
@@ -364,34 +366,35 @@ export class ArbitrageEngine {
             const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
             const targetMint = pool.tokenA === USDC ? pool.tokenB : pool.tokenA;
 
-            // Probe new pools at multiple sizes — fresh liquidity is often mispriced
-            let bestOpp: ArbitrageOpportunity | null = null;
-            for (const size of [10_000_000n, 50_000_000n, 200_000_000n]) {
-              try {
-                const opp = await this.scanner.scanPair(dynPair, USDC, targetMint, size);
-                if (opp && (!bestOpp || opp.profitBps > bestOpp.profitBps)) {
-                  bestOpp = opp;
-                }
-              } catch { break; }
-            }
+            const opp = await this.scanner.scanPair(dynPair, USDC, targetMint, 50_000_000n);
 
-            if (bestOpp && bestOpp.profitBps >= this.config.minProfitBps) {
+            if (opp && opp.profitBps >= this.config.minProfitBps) {
+              this.dynamicPairFailures.delete(dynPair);
               this.metrics.opportunitiesFound++;
               if (this.config.dryRun) {
                 this.logger.info(
-                  { pair: dynPair, profitBps: bestOpp.profitBps, borrow: bestOpp.borrowAmount.toString(), source: "new-pool" },
+                  { pair: dynPair, profitBps: opp.profitBps, source: "new-pool" },
                   "DRY RUN: new pool arb found"
                 );
               } else {
-                await this.executeArbitrage(bestOpp);
+                await this.executeArbitrage(opp);
               }
+            } else {
+              // Track failures — remove after 5 consecutive no-route cycles
+              const fails = (this.dynamicPairFailures.get(dynPair) || 0) + 1;
+              this.dynamicPairFailures.set(dynPair, fails);
+              if (fails >= 5) pairsToRemove.push(dynPair);
             }
-          } catch (err) {
-            this.logger.debug(
-              { pair: dynPair, error: (err as Error).message },
-              "Dynamic pair scan error"
-            );
+          } catch {
+            const fails = (this.dynamicPairFailures.get(dynPair) || 0) + 1;
+            this.dynamicPairFailures.set(dynPair, fails);
+            if (fails >= 5) pairsToRemove.push(dynPair);
           }
+        }
+        for (const p of pairsToRemove) {
+          this.dynamicPairs.delete(p);
+          this.dynamicPairFailures.delete(p);
+          this.logger.info({ pair: p }, "Dropped unroutable dynamic pair");
         }
 
         // Phase 2: Triangular arbitrage scan (10 routes per cycle, rotating)
@@ -419,44 +422,8 @@ export class ArbitrageEngine {
           );
         }
 
-        // Phase 3: Cross-DEX arb scan — top 5 tightest-spread pairs
-        const bestPairs = this.scanner.getBestSpreads();
-        const sortedPairs = [...bestPairs.entries()]
-          .sort((a, b) => b[1].bps - a[1].bps)
-          .slice(0, 5)
-          .map(([pair]) => pair);
-
-        for (const pair of sortedPairs) {
-          const [targetToken, quoteToken] = parsePair(pair);
-
-          try {
-            const crossDex = await this.multiDex.findCrossDexArb(
-              pair,
-              quoteToken,
-              targetToken,
-              this.config.borrowAmount,
-              9 // pool fee bps
-            );
-
-            if (crossDex && crossDex.grossProfitBps >= this.config.minProfitBps) {
-              this.metrics.opportunitiesFound++;
-              this.logger.info(
-                {
-                  pair,
-                  buyDex: crossDex.buyDex,
-                  sellDex: crossDex.sellDex,
-                  profitBps: crossDex.grossProfitBps,
-                },
-                "Cross-DEX arb found"
-              );
-            }
-          } catch (err) {
-            this.logger.debug(
-              { pair, error: (err as Error).message },
-              "Cross-DEX scan error"
-            );
-          }
-        }
+        // Phase 3: Cross-DEX scan disabled — saves API quota
+        // Jupiter already routes across all DEXes internally
 
         this.consecutiveFailures = 0;
       } catch (err) {
