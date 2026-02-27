@@ -272,10 +272,22 @@ export class ArbitrageEngine {
       "Arbitrage engine STARTED"
     );
 
+    // Cap borrow to pool liquidity (avoid Custom 6001 InsufficientLiquidity)
+    let poolLiquidity = 200_000_000n; // default $200
+    try {
+      const poolState = await this.flashLoanClient.getPoolState();
+      poolLiquidity = BigInt(poolState.totalDeposits.toString());
+    } catch { /* use default */ }
+
     // Primary borrow size — single size for main scan to conserve API quota
-    const PRIMARY_BORROW = 100_000_000n; // $100 — balanced for most pools
+    const PRIMARY_BORROW = poolLiquidity < 100_000_000n ? poolLiquidity : 100_000_000n; // $100 or pool max
     // Secondary size — only tested when primary shows near-profitable spread
-    const SECONDARY_BORROW = 500_000_000n; // $500
+    const SECONDARY_BORROW = poolLiquidity < 200_000_000n ? poolLiquidity : 200_000_000n; // $200 or pool max
+
+    this.logger.info(
+      { poolLiquidity: poolLiquidity.toString(), primaryBorrow: PRIMARY_BORROW.toString(), secondaryBorrow: SECONDARY_BORROW.toString() },
+      "Borrow sizes configured"
+    );
 
     // Hot pairs get scanned every cycle; cold pairs rotate
     const HOT_PAIRS = new Set([

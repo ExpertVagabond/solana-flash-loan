@@ -62,53 +62,34 @@ export async function buildArbitrageTransaction(
 
   logger.debug("Building atomic arbitrage transaction...");
 
-  // Re-quote fresh at execution time — cached quotes go stale in ~5s
-  // and cause Jupiter error 0x1788 (route expired).
-  // The on-chain flash loan repayment check + simulation are the real safety nets.
-  logger.debug(
-    { pair: opportunity.pair },
-    "Re-quoting fresh for execution"
-  );
+  // Use cached quotes directly — speed is critical for arb.
+  // Flash loan repay is the safety net: if swap returns less, entire tx reverts.
+  const quoteLeg1 = opportunity.quoteLeg1;
+  const quoteLeg2 = opportunity.quoteLeg2;
 
-  const [freshQuoteLeg1, freshQuoteLeg2] = await Promise.all([
-    jupiterClient.getQuote(
-      opportunity.tokenA,
-      opportunity.tokenB,
-      opportunity.borrowAmount.toString(),
-      slippageBps
-    ),
-    // Leg 2 uses leg 1's output — estimate from original opportunity
-    jupiterClient.getQuote(
-      opportunity.tokenB,
-      opportunity.tokenA,
-      opportunity.leg1OutAmount.toString(),
-      slippageBps
-    ),
-  ]);
-
-  // Verify the fresh quotes are still profitable
-  const freshLeg2Out = BigInt(freshQuoteLeg2.outAmount);
-  if (freshLeg2Out <= opportunity.borrowAmount) {
-    logger.info(
-      {
-        pair: opportunity.pair,
-        borrowAmount: opportunity.borrowAmount.toString(),
-        freshReturn: freshLeg2Out.toString(),
-      },
-      "Fresh quotes no longer profitable — skipping"
-    );
-    throw new Error("Fresh quotes no longer profitable");
+  if (!quoteLeg1 || !quoteLeg2) {
+    throw new Error("Missing cached quotes — scanner must attach quoteLeg1/quoteLeg2");
   }
 
-  // Determine if SOL is involved — if so, disable wrapAndUnwrapSol
-  // to avoid SyncNative IncorrectProgramId conflicts with our existing ATAs
+  const quoteAgeMs = Date.now() - opportunity.timestamp;
+  logger.debug(
+    { quoteAgeMs, pair: opportunity.pair },
+    "Building tx from cached quotes"
+  );
+
+  // Reject quotes older than 10 seconds — too stale even for Jito
+  if (quoteAgeMs > 10_000) {
+    throw new Error(`Quotes too stale: ${quoteAgeMs}ms old (max 10000ms)`);
+  }
+
+  // Determine if SOL is involved — disable wrapAndUnwrapSol to avoid SyncNative conflicts
   const SOL_MINT = "So11111111111111111111111111111111111111112";
   const involvesSol = opportunity.tokenA === SOL_MINT || opportunity.tokenB === SOL_MINT;
 
   // Fetch swap instructions for both legs in parallel
   const [swapIxLeg1, swapIxLeg2] = await Promise.all([
-    jupiterClient.getSwapInstructions(freshQuoteLeg1, borrower.publicKey, !involvesSol),
-    jupiterClient.getSwapInstructions(freshQuoteLeg2, borrower.publicKey, !involvesSol),
+    jupiterClient.getSwapInstructions(quoteLeg1, borrower.publicKey, !involvesSol),
+    jupiterClient.getSwapInstructions(quoteLeg2, borrower.publicKey, !involvesSol),
   ]);
 
   // 2. Build flash loan borrow/repay instructions
