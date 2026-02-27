@@ -175,23 +175,26 @@ export class TriangularScanner {
   private async scanRoute(route: TriangularRoute): Promise<TriangularOpportunity | null> {
     const { tokenA, tokenB, tokenC, borrowAmount } = route;
 
+    // Use direct routes + low maxAccounts for triangular (3 swaps must fit in 1232 bytes)
+    const directOnly = true;
+
     // Leg 1: A → B
     const quoteLeg1 = await this.jupiter.getQuote(
-      tokenA, tokenB, borrowAmount.toString(), this.slippageBps
+      tokenA, tokenB, borrowAmount.toString(), this.slippageBps, directOnly
     );
     const leg1Out = BigInt(quoteLeg1.outAmount);
     if (leg1Out === 0n) return null;
 
     // Leg 2: B → C
     const quoteLeg2 = await this.jupiter.getQuote(
-      tokenB, tokenC, leg1Out.toString(), this.slippageBps
+      tokenB, tokenC, leg1Out.toString(), this.slippageBps, directOnly
     );
     const leg2Out = BigInt(quoteLeg2.outAmount);
     if (leg2Out === 0n) return null;
 
     // Leg 3: C → A
     const quoteLeg3 = await this.jupiter.getQuote(
-      tokenC, tokenA, leg2Out.toString(), this.slippageBps
+      tokenC, tokenA, leg2Out.toString(), this.slippageBps, directOnly
     );
     const leg3Out = BigInt(quoteLeg3.outAmount);
 

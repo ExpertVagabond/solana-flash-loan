@@ -261,7 +261,7 @@ export class JupiterClient {
       amount,
       slippageBps: slippageBps.toString(),
       ...(onlyDirectRoutes ? { onlyDirectRoutes: "true" } : {}),
-      maxAccounts: "40",
+      maxAccounts: onlyDirectRoutes ? "20" : "40",
     });
 
     const url = `${JUPITER_API_BASE}/quote?${params}`;
