@@ -8,7 +8,7 @@ pub mod state;
 
 use instructions::*;
 
-declare_id!("2chVPk6DV21qWuyUA2eHAzATdFSHM7ykv1fVX7Gv6nor");
+declare_id!("8bFFkfzxcZ2hLWKGJHi1ivpzGuqj6BCJZbSdJsNX2RQs");
 
 #[program]
 pub mod solana_flash_loan {
