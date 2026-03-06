@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{Mint, Token, TokenAccount};
+use anchor_spl::token_interface::{Mint, TokenInterface, TokenAccount};
 
 use crate::constants::*;
 use crate::errors::FlashLoanError;
@@ -17,7 +17,7 @@ pub struct InitializePool<'info> {
     )]
     pub pool: Account<'info, LendingPool>,
 
-    pub token_mint: Account<'info, Mint>,
+    pub token_mint: InterfaceAccount<'info, Mint>,
 
     #[account(
         init,
@@ -27,13 +27,13 @@ pub struct InitializePool<'info> {
         token::mint = token_mint,
         token::authority = pool,
     )]
-    pub vault: Account<'info, TokenAccount>,
+    pub vault: InterfaceAccount<'info, TokenAccount>,
 
     #[account(mut)]
     pub admin: Signer<'info>,
 
     pub system_program: Program<'info, System>,
-    pub token_program: Program<'info, Token>,
+    pub token_program: Interface<'info, TokenInterface>,
 }
 
 pub fn handle_initialize_pool(ctx: Context<InitializePool>, fee_basis_points: u16) -> Result<()> {

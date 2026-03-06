@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Token, TokenAccount, Transfer};
+use anchor_spl::token_interface::{Mint, TokenInterface, TokenAccount, TransferChecked, transfer_checked};
 
 use crate::constants::*;
 use crate::errors::FlashLoanError;
@@ -24,22 +24,25 @@ pub struct Withdraw<'info> {
     )]
     pub receipt: Account<'info, DepositReceipt>,
 
+    #[account(constraint = token_mint.key() == pool.token_mint @ FlashLoanError::MintMismatch)]
+    pub token_mint: InterfaceAccount<'info, Mint>,
+
     #[account(
         mut,
         constraint = vault.key() == pool.vault @ FlashLoanError::InvalidVault,
     )]
-    pub vault: Account<'info, TokenAccount>,
+    pub vault: InterfaceAccount<'info, TokenAccount>,
 
     #[account(
         mut,
         constraint = depositor_token_account.mint == pool.token_mint @ FlashLoanError::MintMismatch,
     )]
-    pub depositor_token_account: Account<'info, TokenAccount>,
+    pub depositor_token_account: InterfaceAccount<'info, TokenAccount>,
 
     #[account(mut)]
     pub depositor: Signer<'info>,
 
-    pub token_program: Program<'info, Token>,
+    pub token_program: Interface<'info, TokenInterface>,
 }
 
 pub fn handle_withdraw(ctx: Context<Withdraw>, shares_to_burn: u64) -> Result<()> {
@@ -70,17 +73,19 @@ pub fn handle_withdraw(ctx: Context<Withdraw>, shares_to_burn: u64) -> Result<()
     ];
 
     // Transfer tokens from vault to depositor (PDA-signed)
-    token::transfer(
+    transfer_checked(
         CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),
-            Transfer {
+            TransferChecked {
                 from: ctx.accounts.vault.to_account_info(),
                 to: ctx.accounts.depositor_token_account.to_account_info(),
                 authority: ctx.accounts.pool.to_account_info(),
+                mint: ctx.accounts.token_mint.to_account_info(),
             },
             &[pool_seeds],
         ),
         amount,
+        ctx.accounts.token_mint.decimals,
     )?;
 
     // Update pool state

@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Token, TokenAccount, Transfer};
+use anchor_spl::token_interface::{Mint, TokenInterface, TokenAccount, TransferChecked, transfer_checked};
 
 use crate::constants::*;
 use crate::errors::FlashLoanError;
@@ -27,23 +27,26 @@ pub struct BorrowFlashLoan<'info> {
     )]
     pub flash_loan_receipt: Account<'info, FlashLoanReceipt>,
 
+    #[account(constraint = token_mint.key() == pool.token_mint @ FlashLoanError::MintMismatch)]
+    pub token_mint: InterfaceAccount<'info, Mint>,
+
     #[account(
         mut,
         constraint = vault.key() == pool.vault @ FlashLoanError::InvalidVault,
     )]
-    pub vault: Account<'info, TokenAccount>,
+    pub vault: InterfaceAccount<'info, TokenAccount>,
 
     #[account(
         mut,
         constraint = borrower_token_account.mint == pool.token_mint @ FlashLoanError::MintMismatch,
     )]
-    pub borrower_token_account: Account<'info, TokenAccount>,
+    pub borrower_token_account: InterfaceAccount<'info, TokenAccount>,
 
     #[account(mut)]
     pub borrower: Signer<'info>,
 
     pub system_program: Program<'info, System>,
-    pub token_program: Program<'info, Token>,
+    pub token_program: Interface<'info, TokenInterface>,
 }
 
 pub fn borrow_handler(ctx: Context<BorrowFlashLoan>, amount: u64) -> Result<()> {
@@ -82,17 +85,19 @@ pub fn borrow_handler(ctx: Context<BorrowFlashLoan>, amount: u64) -> Result<()> 
     ];
 
     // Transfer tokens from vault to borrower
-    token::transfer(
+    transfer_checked(
         CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),
-            Transfer {
+            TransferChecked {
                 from: ctx.accounts.vault.to_account_info(),
                 to: ctx.accounts.borrower_token_account.to_account_info(),
                 authority: ctx.accounts.pool.to_account_info(),
+                mint: ctx.accounts.token_mint.to_account_info(),
             },
             &[pool_seeds],
         ),
         amount,
+        ctx.accounts.token_mint.decimals,
     )?;
 
     emit!(FlashLoanBorrowed {
@@ -126,22 +131,25 @@ pub struct RepayFlashLoan<'info> {
     )]
     pub flash_loan_receipt: Account<'info, FlashLoanReceipt>,
 
+    #[account(constraint = token_mint.key() == pool.token_mint @ FlashLoanError::MintMismatch)]
+    pub token_mint: InterfaceAccount<'info, Mint>,
+
     #[account(
         mut,
         constraint = vault.key() == pool.vault @ FlashLoanError::InvalidVault,
     )]
-    pub vault: Account<'info, TokenAccount>,
+    pub vault: InterfaceAccount<'info, TokenAccount>,
 
     #[account(
         mut,
         constraint = borrower_token_account.mint == pool.token_mint @ FlashLoanError::MintMismatch,
     )]
-    pub borrower_token_account: Account<'info, TokenAccount>,
+    pub borrower_token_account: InterfaceAccount<'info, TokenAccount>,
 
     #[account(mut)]
     pub borrower: Signer<'info>,
 
-    pub token_program: Program<'info, Token>,
+    pub token_program: Interface<'info, TokenInterface>,
 }
 
 pub fn repay_handler(ctx: Context<RepayFlashLoan>) -> Result<()> {
@@ -152,16 +160,18 @@ pub fn repay_handler(ctx: Context<RepayFlashLoan>) -> Result<()> {
         .ok_or(FlashLoanError::MathOverflow)?;
 
     // Transfer repayment (principal + fee) from borrower to vault
-    token::transfer(
+    transfer_checked(
         CpiContext::new(
             ctx.accounts.token_program.to_account_info(),
-            Transfer {
+            TransferChecked {
                 from: ctx.accounts.borrower_token_account.to_account_info(),
                 to: ctx.accounts.vault.to_account_info(),
                 authority: ctx.accounts.borrower.to_account_info(),
+                mint: ctx.accounts.token_mint.to_account_info(),
             },
         ),
         repayment,
+        ctx.accounts.token_mint.decimals,
     )?;
 
     // Update pool: fees increase total_deposits (shared among LP holders)
